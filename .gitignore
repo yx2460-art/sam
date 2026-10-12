@@ -1,0 +1,13 @@
+.idea/
+.vscode/
+__pycache__/
+*.py[cod]
+*.pth
+*.pt
+*.pkl
+*.npy
+*.onnx
+.env
+.env.*
+!.env.example
+node_modules/
