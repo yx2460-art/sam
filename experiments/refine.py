@@ -47,6 +47,7 @@ def refine_image(rgb, original, predictor, args):
             raise ValueError('Instance ID overflow')
         output[mask] = next_id
         next_id += 1
+        return next_id - 1
 
     for original_id in np.unique(original[original > 0]):
         components, count = ndimage.label(original == original_id, structure=structure)
@@ -123,22 +124,37 @@ def refine_image(rgb, original, predictor, args):
                 reason = 'low_coverage_original_preserved'
                 accepted = []
                 residual_area = area
+                residual_components = 0
+                output_count = 1
             else:
+                candidate_labels = np.zeros(region.shape, dtype=np.uint32)
                 for mask, _, _ in accepted:
-                    assign(mask)
+                    candidate_labels[mask] = assign(mask)
                 # Preserve uncovered original pixels; SAM must not silently delete parcels.
+                # Residual pieces are not evidence of additional parcels. Attach them
+                # to accepted IDs rather than manufacturing a new ID for each piece.
                 residual = region & ~occupied
                 residual_area = int(residual.sum())
-                cc, n = ndimage.label(residual, structure=structure)
-                for label_id in range(1, n + 1):
-                    assign(cc == label_id)
-                reason = 'accepted_with_residual_preservation'
+                _, residual_components = ndimage.label(residual, structure=structure)
+                if residual_area:
+                    if len(accepted) == 1:
+                        output[residual] = candidate_labels[occupied][0]
+                    else:
+                        # Only this source component's candidates can claim its residual.
+                        # Nearest assignment is deterministic and cannot steal neighbors.
+                        nearest = ndimage.distance_transform_edt(
+                            candidate_labels == 0, return_distances=False, return_indices=True)
+                        output[residual] = candidate_labels[tuple(nearest[:, residual])]
+                reason = 'accepted_with_residual_attachment'
+                output_count = len(accepted)
             records.append({'source_id': int(original_id), 'component': component_id,
                             'reason': reason, 'prompt_count': len(points),
                             'box_xyxy': box.tolist(),
                             'points_xy': [None if point is None else point.tolist() for point in points],
                             'candidate_count': len(candidates), 'accepted_count': len(accepted),
                             'coverage': coverage, 'residual_pixels': residual_area,
+                            'residual_components_attached': int(residual_components),
+                            'output_instance_count': output_count,
                             'stability_scores': [stability for _, stability, _ in accepted],
                             'sam_scores': [score for _, _, score in accepted]})
     return output, records

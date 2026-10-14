@@ -107,6 +107,32 @@ class RefinementTests(unittest.TestCase):
         for x, y in points:
             self.assertEqual(self.original[int(y), int(x)], 5)
 
+    def test_multiple_residual_fragments_do_not_become_new_instances(self):
+        # A centered cross leaves four disconnected corner residuals. The previous
+        # algorithm turned one source parcel into five predicted parcels.
+        candidate = np.zeros_like(self.original, dtype=bool)
+        candidate[3:17, 6:14] = True
+        candidate[6:14, 3:17] = True
+        out, logs = refine_image(self.rgb, self.original,
+                                 FakePredictor([candidate]), options())
+        np.testing.assert_array_equal(out > 0, self.original > 0)
+        self.assertEqual(len(np.unique(out[out > 0])), 1)
+        self.assertEqual(logs[0]['residual_components_attached'], 4)
+        self.assertEqual(logs[0]['output_instance_count'], 1)
+
+    def test_multi_candidate_residual_uses_only_existing_ids(self):
+        left = np.zeros_like(self.original, dtype=bool)
+        right = left.copy()
+        left[4:16, 3:9] = True
+        right[4:16, 11:17] = True
+        out, logs = refine_image(self.rgb, self.original,
+                                 FakePredictor([left, right]), options(mode='box'))
+        self.assertEqual(logs[0]['accepted_count'], 2)
+        self.assertEqual(len(np.unique(out[out > 0])), 2)
+        np.testing.assert_array_equal(out > 0, self.original > 0)
+        self.assertEqual(out[3, 4], out[5, 4])
+        self.assertEqual(out[3, 15], out[5, 15])
+
     def test_other_objects_preserved_and_low_score_fallback(self):
         self.original[3:17, 17:19] = 8
         out, logs = refine_image(self.rgb, self.original,
