@@ -33,6 +33,9 @@ def generate_points(rgb, region, mode, args):
 
 
 def refine_image(rgb, original, predictor, args):
+    residual_policy = args.residual_policy
+    if residual_policy not in {'attach', 'replace'}:
+        raise ValueError(f'Unknown residual policy: {residual_policy}')
     output = np.zeros(original.shape, dtype=np.uint32)
     records = []
     next_id = 1
@@ -57,7 +60,9 @@ def refine_image(rgb, original, predictor, args):
             if area < args.min_area:
                 assign(region)
                 records.append({'source_id': int(original_id), 'component': component_id,
-                                'reason': 'small_component_preserved', 'prompt_count': 0})
+                                'reason': 'small_component_preserved', 'prompt_count': 0,
+                                'residual_policy': residual_policy, 'removed_pixels': 0,
+                                'output_instance_count': 1})
                 continue
             ys, xs = np.where(region)
             box = np.array([max(0, xs.min() - args.box_pad), max(0, ys.min() - args.box_pad),
@@ -119,7 +124,8 @@ def refine_image(rgb, original, predictor, args):
                 occupied |= candidate
                 accepted.append((candidate, stability, score))
             coverage = float((occupied & region).sum() / area)
-            if coverage < args.min_coverage:
+            removed_pixels = 0
+            if not accepted or coverage < args.min_coverage:
                 assign(region)
                 reason = 'low_coverage_original_preserved'
                 accepted = []
@@ -136,7 +142,7 @@ def refine_image(rgb, original, predictor, args):
                 residual = region & ~occupied
                 residual_area = int(residual.sum())
                 _, residual_components = ndimage.label(residual, structure=structure)
-                if residual_area:
+                if residual_area and residual_policy == 'attach':
                     if len(accepted) == 1:
                         output[residual] = candidate_labels[occupied][0]
                     else:
@@ -146,9 +152,14 @@ def refine_image(rgb, original, predictor, args):
                             candidate_labels == 0, return_distances=False, return_indices=True)
                         output[residual] = candidate_labels[tuple(nearest[:, residual])]
                 reason = 'accepted_with_residual_attachment'
+                if residual_policy == 'replace':
+                    removed_pixels = residual_area
+                    residual_components = 0
+                    reason = 'accepted_sam_replacement'
                 output_count = len(accepted)
             records.append({'source_id': int(original_id), 'component': component_id,
                             'reason': reason, 'prompt_count': len(points),
+                            'residual_policy': residual_policy, 'removed_pixels': removed_pixels,
                             'box_xyxy': box.tolist(),
                             'points_xy': [None if point is None else point.tolist() for point in points],
                             'candidate_count': len(candidates), 'accepted_count': len(accepted),

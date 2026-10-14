@@ -16,7 +16,7 @@ from experiments.refine import generate_points, interior_point, refine_image
 
 
 def options(**kwargs):
-    defaults = dict(mode='interior', box_pad=2, support_pad=0, min_area=3,
+    defaults = dict(mode='interior', residual_policy='attach', box_pad=2, support_pad=0, min_area=3,
                     superpixel_area=25, compactness=10, min_radius=1, max_points=8,
                     min_score=0.8, min_stability=0.9, stability_offset=1,
                     min_support=0.8, min_coverage=0.5, max_overlap=0.05)
@@ -106,6 +106,33 @@ class RefinementTests(unittest.TestCase):
         self.assertTrue(1 <= len(points) <= 3)
         for x, y in points:
             self.assertEqual(self.original[int(y), int(x)], 5)
+
+    def test_replace_can_remove_residual_without_creating_instances(self):
+        candidate = np.zeros_like(self.original, dtype=bool)
+        candidate[4:16, 4:16] = True
+        out, logs = refine_image(self.rgb, self.original, FakePredictor([candidate]),
+                                 options(residual_policy='replace'))
+        np.testing.assert_array_equal(out > 0, candidate)
+        self.assertEqual(logs[0]['removed_pixels'], 196 - 144)
+        self.assertEqual(logs[0]['residual_components_attached'], 0)
+        self.assertEqual(logs[0]['output_instance_count'], 1)
+
+    def test_replace_low_coverage_and_rejected_candidates_keep_original(self):
+        candidate = np.zeros_like(self.original, dtype=bool)
+        candidate[8:12, 8:12] = True
+        for score, threshold in [(0.95, 0.5), (0.1, 0.0)]:
+            out, logs = refine_image(self.rgb, self.original, FakePredictor([candidate], score),
+                                     options(residual_policy='replace', min_coverage=threshold))
+            np.testing.assert_array_equal(out > 0, self.original > 0)
+            self.assertEqual(logs[0]['removed_pixels'], 0)
+
+    def test_replace_does_not_overwrite_neighbor_instance(self):
+        self.original[3:17, 17:19] = 8
+        candidate = self.original > 0
+        out, logs = refine_image(self.rgb, self.original, FakePredictor([candidate]),
+                                 options(residual_policy='replace', mode='box', support_pad=3))
+        self.assertNotEqual(out[5, 5], out[5, 18])
+        self.assertTrue(np.all(out[self.original == 8] > 0))
 
     def test_multiple_residual_fragments_do_not_become_new_instances(self):
         # A centered cross leaves four disconnected corner residuals. The previous

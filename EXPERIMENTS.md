@@ -94,6 +94,14 @@ E1–E3 的输入连通组件拆分属于共同预处理，E0 使用原输出。
 
 ## 指标与接受标准
 
+### 残余像素处理对照
+
+新增 `--residual-policy attach|replace`，默认 `attach` 维持已有实验行为。`replace` 模式只保存通过既有质量、面积、支持率和覆盖率检查的 SAM 候选，允许移除未覆盖的原始前景；候选为空、覆盖率不足或原组件面积太小时仍保留原组件。日志中的 `removed_pixels` 记录本组件被移除的原始前景像素，不能直接解释为纠正了多少误检。
+
+先固定原有 `ids20.txt`、`--mode interior` 和所有阈值，仅增加 `--residual-policy replace`，输出到 `outputs/replace20`，评价输出到 `outputs/replace20_eval`，与 `outputs/point20_eval` 和 `outputs/base20_eval` 对照。此轮不加入自动负点，不读取真值生成提示。检查 Precision/PQ 是否改善，以及 Recall 是否下降，保留所有旧结果。不要仅根据一张图的边缘更平滑判断有效。
+
+替换模式可能误删真实田块区域，默认覆盖率门槛仅为 0.5，并不保证语义正确。它也不能恢复完全漏掉的实例或自动删除没有合格 SAM 候选的假阳性。若实验支持进一步改进，再另做负点提示对照。
+
 主要比较 Mask Precision/Recall/IoU/Dice、Instance Precision/Recall/F1、匹配实例平均 IoU、PQ，以及实例边界 F1。实例采用与本地 BsiNet `validate_best.py` 相同的 IoU >= 0.50 降序贪心一对一匹配。边界包含不同实例 ID 之间的内部边界，采用 4 邻域标签变化、前景一侧像素，默认容差为 2 像素（方形 Chebyshev 邻域），容差必须在所有组保持一致。图像外侧不构造虚拟边界。分母为零的分数记为 0，计数同时保留用于解释空图。
 
 不要沿用旧 BsiNet `eval.py` 的 GOC/GUC/GTC 命名：那里实际计算 Accuracy/IoU/Dice；论文的 GTC 是对象级几何分类误差，Dice 不是论文 GTC。本实验没有实现论文 GTC，也不报告它。

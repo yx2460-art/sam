@@ -20,6 +20,8 @@ def parser():
     p.add_argument('--checkpoint', type=Path, required=True)
     p.add_argument('--output-dir', type=Path, required=True, help='New, nonexistent experiment directory')
     p.add_argument('--mode', choices=['box', 'interior', 'slic'], required=True)
+    p.add_argument('--residual-policy', choices=['attach', 'replace'], default='attach',
+                   help='attach preserves source pixels; replace keeps accepted SAM masks only')
     p.add_argument('--model-type', choices=['vit_b', 'vit_l', 'vit_h'], default='vit_b')
     p.add_argument('--device', default='cuda:0')
     p.add_argument('--rgb-bands', type=int, nargs=3, default=[1, 2, 3])
