@@ -1,0 +1,35 @@
+# 整图实验前检查
+
+在 Linux 的 `sam-experiments` 项目 PyCharm 底部 Terminal 中运行，激活 `sam-exp`。不需要重新安装依赖、加载 SAM 权重或使用 GPU。
+
+```bash
+cd ~/xy/sam-experiments
+conda activate sam-exp
+python -m experiments.check_full --image '/home/xubo/xy/data/塔城镇_49(1).tif' --gt /home/xubo/xy/data/qgis_label_result3/instance.tif --prediction /home/xubo/xy/bsinet/BsiNet-torch-main_ori/full_prediction_E_overlap/full_instance.tif --coverage /home/xubo/xy/bsinet/BsiNet-torch-main_ori/full_prediction_E_overlap/full_coverage.tif --output-dir outputs/check
+```
+
+路径来自当前实验配置，缺少文件时脚本会报出具体路径，不会猜测替代数据。影像名称的括号必须保留引号。输出目录必须不存在；重跑请改为 `outputs/check2`，不覆盖旧报告。
+
+输出：
+
+- `report.txt`：首先阅读的检查报告。
+- `report.json`：详细元数据、计数及原预测目录的 `full_inference_summary.json` 内容。
+- `preview.tif`：降采样的地理参考诊断图，可在 QGIS 打开。红色表示有效覆盖之外的真值前景，蓝色为覆盖内背景，绿色为覆盖内真值前景，深灰为未覆盖且无真值前景；它不是精度图，也不是 RGB 原图。
+
+脚本分块检查尺寸、CRS、仿射网格、波段、标签整数类型、负值、NoData 和覆盖值，并统计影像有效区、覆盖区、覆盖外真值/预测前景。不重投影、不重采样输入，不修改任何输入文件。元数据不对齐时仍生成失败报告并返回非零退出码，不继续逐像素分析。
+
+标签的 `NoData=0` 按 BsiNet 约定作为背景编号统计；不能因此认定这些区域已完整标注。影像有效区取前三波段的掩膜与有限值交集；此阶段不推断 RGB 顺序或归一化范围，后续推理前另行确认。预览采用最近邻缩小，会遗漏很细的区域，数字统计以原始网格为准。
+
+第一轮不传 `--split-dir`，报告会明确提示训练/验证区域未核实。不能把旧 `train_qgis_yn3` 的列表直接当作 `weight_train_overlap_yn` 权重的实际训练划分。
+
+确定实际训练该权重所用的数据目录后，可追加 `--split-dir /实际数据目录`。需要同时包含 `tiles_index.csv`（filename,x,y）、`train_ids.txt`、`val_ids.txt`。`--tile-size` 是该索引对应的原始切片大小，默认256；不是将来 SAM 实验的窗口大小。`--train-buffer` 默认256像素，以矩形方式排除训练足迹附近区域。
+
+指定划分后输出 `potential_validation.tif`：验证列表覆盖矩形 ∩ 影像有效区 ∩ 预测覆盖区 − 带缓冲的训练足迹。它不包含采样时被丢弃的验证背景区域，不自动外推为连续验证区。脚本检测空间像元重叠，即使训练和验证 ID 不同也会统计重叠并排除。
+
+如果另有人工确认的完整标注区域，可追加 `--annotation-roi /path/to/roi.tif`，只保留其有效非零区域。它必须逐像素对齐。脚本无法证明用户提供的 ROI 已完整标注，也无法证明所提供的划分确实用于权重训练，所以 `evaluation_ready` 始终为 false。待检查报告、实际训练记录和标注范围人工核实后，才选择固定实验区。此次不计算精度，不自动选取最佳结果区域，不开始九组分块实验。
+
+本地合成检查：
+
+```bash
+python -m unittest discover -s tests -v
+```
