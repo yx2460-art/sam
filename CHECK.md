@@ -1,5 +1,11 @@
 # 整图实验前检查
 
+## 显式允许 CRS 差异的像素诊断
+
+默认仍严格检查 CRS。已核对数据来源、尺寸和像素网格，仍存在 CRS 表达差异时，可在命令末尾添加 `--allow-crs-mismatch`，并使用新输出目录 `outputs/check2`。该参数只将“双方都有 CRS 且仅 CRS 不同”降为警告；缺失 CRS、尺寸或仿射变换不同仍然报错。不重投影、不修改输入，不认定 CRS 等价，`evaluation_ready` 仍为 false。
+
+JSON 记录 `allow_crs_mismatch`、`crs_mismatch_bypassed_for` 和 `crs_equivalence_confirmed=false`。预览和候选掩膜使用原始影像的坐标元数据，尚未确认地理参考等价前只作像素诊断，不应当作已校准的地理成果。
+
 在 Linux 的 `sam-experiments` 项目 PyCharm 底部 Terminal 中运行，激活 `sam-exp`。不需要重新安装依赖、加载 SAM 权重或使用 GPU。
 
 ```bash

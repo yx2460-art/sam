@@ -56,6 +56,40 @@ class FullCheckTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 audit(args)
 
+    def test_crs_override_is_explicit_and_preserves_source(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            args = self.setup_rasters(root)
+            with rasterio.open(args.prediction, 'r+') as dst:
+                dst.crs = 'EPSG:32649'
+            before = args.prediction.read_bytes()
+            self.assertEqual(audit(args)['status'], 'failed')
+            args.output_dir = root / 'override'
+            args.allow_crs_mismatch = True
+            result = audit(args)
+            self.assertFalse(result['errors'])
+            self.assertEqual(result['counts']['coverage'], 32)
+            self.assertEqual(result['crs_mismatch_bypassed_for'], ['prediction'])
+            self.assertFalse(result['evaluation_ready'])
+            self.assertFalse(result['crs_equivalence_confirmed'])
+            self.assertEqual(args.prediction.read_bytes(), before)
+
+    def test_override_does_not_allow_grid_size_or_missing_crs(self):
+        cases = [(8, 101, 'EPSG:32649'), (7, 100, 'EPSG:32649'), (8, 100, None)]
+        for width, origin, crs in cases:
+            with self.subTest(width=width, crs=crs), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                args = self.setup_rasters(root)
+                with rasterio.open(args.prediction, 'w', driver='GTiff', width=width,
+                                   height=8, count=1, dtype='uint8', crs=crs,
+                                   transform=from_origin(origin, 200, 1, 1)) as dst:
+                    dst.write(np.zeros((1, 8, width), dtype=np.uint8))
+                args.allow_crs_mismatch = True
+                result = audit(args)
+                self.assertEqual(result['status'], 'failed')
+                self.assertEqual(result['crs_mismatch_bypassed_for'], [])
+                self.assertFalse(result['counts'])
+
     def test_split_overlap_is_excluded_and_missing_ids_fail(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

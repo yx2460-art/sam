@@ -74,7 +74,9 @@ def audit(args):
         raise FileExistsError(f'Use a new output directory: {args.output_dir}')
     report = {'status': 'needs_review', 'errors': [], 'warnings': [], 'rasters': {},
               'annotation_completeness_confirmed': False,
-              'evaluation_ready': False, 'counts': {}}
+              'evaluation_ready': False, 'counts': {},
+              'allow_crs_mismatch': bool(getattr(args, 'allow_crs_mismatch', False)),
+              'crs_mismatch_bypassed_for': [], 'crs_equivalence_confirmed': False}
     with ExitStack() as stack:
         paths = {'image': args.image, 'gt': args.gt, 'prediction': args.prediction,
                  'coverage': args.coverage}
@@ -84,7 +86,15 @@ def audit(args):
         ref = sources['image']
         for key, src in sources.items():
             report['rasters'][key] = metadata(src)
-            report['errors'].extend(f'{key}: {error}' for error in grid_errors(ref, src))
+            issues = grid_errors(ref, src)
+            if report['allow_crs_mismatch'] and issues == ['CRS differs']:
+                report['warnings'].append(
+                    f'{key}: CRS differs; explicitly using identical dimensions and affine grid '
+                    'for pixel-wise diagnostics only. CRS equivalence remains unverified; '
+                    'no input metadata or pixels were changed.')
+                report['crs_mismatch_bypassed_for'].append(key)
+            else:
+                report['errors'].extend(f'{key}: {error}' for error in issues)
             if key != 'image' and src.count != 1:
                 report['errors'].append(f'{key}: expected a one-band raster')
             if key in {'gt', 'prediction'}:
@@ -206,6 +216,9 @@ def main():
     p.add_argument('--annotation-roi', type=Path, help='Confirmed completely labeled area, nonzero=inside')
     p.add_argument('--tile-size', type=int, default=256, help='Tile size used to create split index')
     p.add_argument('--train-buffer', type=int, default=256)
+    p.add_argument('--allow-crs-mismatch', action='store_true',
+                   help='Allow differing nonmissing CRS only on identical dimensions/affine grids; '
+                        'pixel-wise diagnostics only, does not certify CRS equivalence')
     args = p.parse_args()
     if args.tile_size <= 0 or args.train_buffer < 0:
         p.error('tile-size must be positive and train-buffer nonnegative')
