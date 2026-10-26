@@ -127,6 +127,30 @@ class FullCheckTests(unittest.TestCase):
             saved = json.loads((args.output_dir / 'report.json').read_text(encoding='utf-8'))
             self.assertFalse(saved['annotation_completeness_confirmed'])
 
+    def test_multiple_splits_exclude_training_union_from_common_validation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            args = self.setup_rasters(root)
+            directories = [root / 'one', root / 'two']
+            for i, directory in enumerate(directories):
+                directory.mkdir()
+                (directory / 'train_ids.txt').write_text('a\n')
+                (directory / 'val_ids.txt').write_text('b\n')
+                with (directory / 'tiles_index.csv').open('w', newline='') as stream:
+                    writer = csv.DictWriter(stream, fieldnames=['filename', 'x', 'y'])
+                    writer.writeheader()
+                    writer.writerows([dict(filename='a.tif', x=0, y=i*2),
+                                      dict(filename='b.tif', x=0, y=4)])
+            args.split_dir = directories
+            args.complete_annotation = True
+            result = audit(args)
+            self.assertEqual(result['counts']['common_val_pixels'], 16)
+            self.assertEqual(result['counts']['potential_validation'], 8)
+            self.assertEqual(result['counts']['train_pixels'], 24)
+            self.assertTrue(result['annotation_completeness_confirmed'])
+            self.assertFalse(result['evaluation_ready'])
+            self.assertEqual(len(result['splits']), 2)
+
 
 if __name__ == '__main__':
     unittest.main()

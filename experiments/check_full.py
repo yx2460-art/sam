@@ -73,7 +73,8 @@ def audit(args):
     if args.output_dir.exists():
         raise FileExistsError(f'Use a new output directory: {args.output_dir}')
     report = {'status': 'needs_review', 'errors': [], 'warnings': [], 'rasters': {},
-              'annotation_completeness_confirmed': False,
+              'annotation_completeness_confirmed': bool(getattr(args, 'complete_annotation', False)),
+              'annotation_confirmation_source': 'user assertion' if getattr(args, 'complete_annotation', False) else None,
               'evaluation_ready': False, 'counts': {},
               'allow_crs_mismatch': bool(getattr(args, 'allow_crs_mismatch', False)),
               'crs_mismatch_bypassed_for': [], 'crs_equivalence_confirmed': False}
@@ -105,16 +106,29 @@ def audit(args):
         if ref.count < 3:
             report['errors'].append('image: expected at least three RGB bands; inspect band order')
         train, val = [], []
+        val_groups = []
         if args.split_dir:
-            try:
-                train, val = load_split(args.split_dir, args.tile_size, ref.width, ref.height)
-                report['split'] = {'directory': str(args.split_dir), 'train_tiles': len(train),
-                                   'val_tiles': len(val), 'tile_size': args.tile_size,
-                                   'train_buffer_pixels': args.train_buffer,
-                                   'footprint_mode': 'listed rectangles only',
-                                   'matches_checkpoint_training_split_confirmed': False}
-            except (ValueError, KeyError, OSError) as error:
-                report['errors'].append(f'split: {error}')
+            directories = args.split_dir if isinstance(args.split_dir, (list, tuple)) else [args.split_dir]
+            report['splits'] = []
+            for directory in directories:
+                try:
+                    split_train, split_val = load_split(directory, args.tile_size, ref.width, ref.height)
+                    train.extend(split_train)
+                    val.extend(split_val)
+                    val_groups.append(split_val)
+                    report['splits'].append({'directory': str(directory), 'train_tiles': len(split_train),
+                                             'val_tiles': len(split_val), 'tile_size': args.tile_size,
+                                             'matches_checkpoint_training_split_confirmed': False,
+                                             'index_source_image_confirmed': False})
+                except (ValueError, KeyError, OSError) as error:
+                    report['errors'].append(f'split {directory}: {error}')
+            report['split_policy'] = {
+                'training': 'union of all candidate training rectangles',
+                'validation': 'intersection of all candidate validation footprints',
+                'train_buffer_pixels': args.train_buffer, 'footprint_mode': 'listed rectangles only'}
+            report['warnings'].append('Candidate indexes must refer to the same source image/grid; '
+                                      'candidate list may not exhaust actual training sources. '
+                                      'A common area does not prove independence from unknown training data.')
         else:
             report['warnings'].append('No training/validation split supplied; held-out area is unverified.')
         summary = args.prediction.parent / 'full_inference_summary.json'
@@ -129,7 +143,7 @@ def audit(args):
         else:
             report['warnings'].append('Prediction summary absent; model and inference provenance unverified.')
         report['warnings'].append('GT ID 0 is background, not proof of complete annotation.')
-        if not args.annotation_roi:
+        if not args.annotation_roi and not report['annotation_completeness_confirmed']:
             report['warnings'].append('No confirmed annotation ROI supplied; no evaluation area is approved.')
         args.output_dir.mkdir(parents=True)
         if not report['errors']:
@@ -140,7 +154,8 @@ def audit(args):
                 args.output_dir / 'potential_validation.tif', 'w', **profile)) if val else None
             names = ('pixels', 'image_valid', 'coverage', 'coverage_on_valid', 'gt_foreground',
                      'gt_outside_coverage', 'prediction_foreground', 'prediction_outside_coverage',
-                     'train_pixels', 'val_pixels', 'train_val_overlap', 'potential_validation')
+                     'train_pixels', 'val_pixels', 'common_val_pixels', 'train_val_overlap',
+                     'potential_validation', 'potential_gt_foreground', 'potential_pred_foreground')
             counts = dict.fromkeys(names, 0)
             for y in range(0, ref.height, 512):
                 for x in range(0, ref.width, 512):
@@ -157,15 +172,19 @@ def audit(args):
                         report['errors'].append('Coverage must contain only 0/1 or 0/255')
                     covered = cov > 0
                     tr, va = footprint(train, window), footprint(val, window)
-                    candidate = valid & covered & va & ~footprint(train, window, args.train_buffer)
+                    common_val = np.ones(valid.shape, dtype=bool) if val_groups else np.zeros(valid.shape, dtype=bool)
+                    for group in val_groups:
+                        common_val &= footprint(group, window)
+                    candidate = valid & covered & common_val & ~footprint(train, window, args.train_buffer)
                     if args.annotation_roi:
                         roi = sources['annotation_roi'].read(1, window=window)
                         candidate &= (roi > 0) & np.isfinite(roi) & (
                             sources['annotation_roi'].read_masks(1, window=window) > 0)
                     values = [valid.size, valid.sum(), covered.sum(), (covered & valid).sum(),
                               (gt > 0).sum(), ((gt > 0) & ~covered).sum(), (pred > 0).sum(),
-                              ((pred > 0) & ~covered).sum(), tr.sum(), va.sum(), (tr & va).sum(),
-                              candidate.sum()]
+                              ((pred > 0) & ~covered).sum(), tr.sum(), va.sum(), common_val.sum(),
+                              (tr & va).sum(), candidate.sum(),
+                              (candidate & (gt > 0)).sum(), (candidate & (pred > 0)).sum()]
                     for key, value in zip(names, values):
                         counts[key] += int(value)
                     if potential:
@@ -212,7 +231,10 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ('image', 'gt', 'prediction', 'coverage', 'output-dir'):
         p.add_argument('--' + name, type=Path, required=True)
-    p.add_argument('--split-dir', type=Path, help='Actual checkpoint training split directory')
+    p.add_argument('--split-dir', type=Path, action='append',
+                   help='Repeat for candidate splits: exclude training union, use validation intersection')
+    p.add_argument('--complete-annotation', action='store_true',
+                   help='User confirms all valid source pixels are completely annotated; not automatically verified')
     p.add_argument('--annotation-roi', type=Path, help='Confirmed completely labeled area, nonzero=inside')
     p.add_argument('--tile-size', type=int, default=256, help='Tile size used to create split index')
     p.add_argument('--train-buffer', type=int, default=256)
