@@ -88,6 +88,17 @@ class RegionTests(unittest.TestCase):
             self.assertEqual(report['status'],'complete')
             self.assertTrue((args.output_dir/'comparison.csv').exists())
             self.assertEqual(report['processed_regions'],2)
+            from experiments.diagnose_regions import diagnose
+            diagnostic=diagnose(args.output_dir,args.gt,root/'diagnosis')
+            for method in ('conflict','random'):
+                rows=[r for r in diagnostic['rows'] if r['method']==method and r['location']=='all']
+                total=next(r for r in rows if r['region']=='all_roi')
+                parts=[r for r in rows if r['region'] in ('selected_raw_conflict','write_outside_raw_conflict','outside_write')]
+                for key in ('removed_true_foreground','removed_false_foreground','added_true_foreground','added_false_foreground'):
+                    self.assertEqual(total[key],sum(r[key] for r in parts))
+            self.assertTrue((root/'diagnosis'/'summary.txt').exists())
+            with self.assertRaises(FileExistsError):
+                diagnose(args.output_dir,args.gt,root/'diagnosis')
             with rasterio.open(args.union_dir/'instance.tif') as src:
                 union=src.read(1)
             for method in ('conflict','random'):

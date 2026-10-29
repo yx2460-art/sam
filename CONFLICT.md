@@ -54,3 +54,16 @@ python -m experiments.refine_conflicts --union-dir outputs/fusion/union --checkp
 局部评价域对所有方法相同，不根据处理后的结果重选冲突像素。窄冲突域按边界容差腐蚀后可能没有可评分的内部边界，边界分母为0时分数为0；必须结合counts解释，不能称为边界精度下降到0。实例F1/PQ仍是ROI裁剪口径，尤其不宜拿窄局部域的PQ解释完整田块变化。
 
 训练来源独立性和CRS等价仍未确认，本阶段只作开发对照。判断效果需同时看全局IoU/Recall/PQ、原冲突域变化、一致域是否受损，以及实际处理调用和时间；不只挑一项提高。随机组主要检验定位作用；由于两组空间内容、实例数量和实际可接受候选不同，首次比较不能单独证明因果或泛化提升。
+# Offline diagnosis after inference
+
+Run from the Linux project root with the existing `sam-exp` environment:
+
+```bash
+python -m experiments.diagnose_regions --run-dir outputs/region --gt "$HOME/xy/data/qgis_label_result3/instance.tif" --output-dir outputs/diagnosis
+```
+
+This does not load SAM or rerun inference. It leaves the region experiment unchanged and writes a short `summary.txt`, a `changes.csv`, and a provenance-bearing `diagnosis.json`. Use a new output directory on each run.
+
+Changes are counted relative to union: removed true foreground (harmful deletion), removed false foreground (correct deletion), added true foreground, added false foreground, and foreground ID changes. These are gross transition counts, not net TP/FP differences. Masks distinguish all ROI, original conflict, selected original conflict, planned writes outside original conflict, and outside planned writes. For the conflict arm, writes outside original conflict are the selected buffer area; for random they are the random control area.
+
+Each mask is also split by proximity to GT instance boundaries and first-stage window perimeters (default Chebyshev radius 2 pixels, configurable with `--radius`). Boundary and window-edge categories overlap: do not sum across these two classifications. GT is used only for post-hoc diagnosis, never inference or selection. These are foreground pixel diagnostics, not independent test or parcel-identity accuracy. Recorded hashes validate available source provenance; hashes for current region outputs are snapshots, not proof they were sealed at inference time.
