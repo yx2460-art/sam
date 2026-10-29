@@ -151,6 +151,29 @@ class TileTests(unittest.TestCase):
                     refusion(args.output_dir,root/'fusion')
                 self.assertFalse((root/'fusion').exists())
 
+    def test_cached_crs_override_requires_explicit_source_option(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            args,_=self.fixture(root)
+            run(args,refine=self.identity)
+            for name in ('count.tif','instance.tif'):
+                with rasterio.open(args.output_dir/name,'r+') as dst:
+                    dst.crs='EPSG:32649'
+            with self.assertRaisesRegex(ValueError,'CRS differs'):
+                refusion(args.output_dir,root/'strict')
+            path=args.output_dir/'manifest.json'
+            info=json.loads(path.read_text())
+            info['parameters']['allow_crs_mismatch']=True
+            path.write_text(json.dumps(info))
+            result=refusion(args.output_dir,root/'allowed',args.gt,methods=['center'])
+            self.assertEqual(len(result['cached_output_crs_overrides']),2)
+            self.assertFalse(result['crs_equivalence_confirmed'])
+            # Even with the override, a real one-pixel shift must still fail.
+            with rasterio.open(args.output_dir/'count.tif','r+') as dst:
+                dst.transform=from_origin(101,200,1,1)
+            with self.assertRaisesRegex(ValueError,'affine pixel grid differs'):
+                refusion(args.output_dir,root/'shifted')
+
 
 if __name__=='__main__':
     unittest.main()

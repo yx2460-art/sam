@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import rasterio
@@ -93,10 +94,16 @@ def refusion(run_dir, output_dir, gt_path=None, methods=METHODS):
         for src in (base,roi,coverage):
             aligned(image,src,allow)
         expected_transform = image.window_transform(Window(x0,y0,shape[1],shape[0]))
+        expected_grid = SimpleNamespace(width=shape[1],height=shape[0],
+                                        crs=image.crs,transform=expected_transform)
+        cached_crs_overrides = []
         for src in (stored_count,stored_instance):
-            if src.shape != shape or src.crs != image.crs or not np.allclose(
-                    tuple(src.transform), tuple(expected_transform), rtol=0, atol=1e-8):
-                raise ValueError(f'Cached output grid mismatch: {src.name}')
+            try:
+                issues = aligned(expected_grid,src,allow)
+            except ValueError as error:
+                raise ValueError(f'Cached output grid mismatch: {error}') from error
+            if issues:
+                cached_crs_overrides.append(src.name)
         stats = dict(scoring_pixels=0,scoring_overlap_pixels=0,scoring_conflict_pixels=0,
                      observed_pixels=0,total_observations=0)
         for win, sl in blocks(shape):
@@ -129,6 +136,8 @@ def refusion(run_dir, output_dir, gt_path=None, methods=METHODS):
         revision = subprocess.run(['git','rev-parse','HEAD'],capture_output=True,text=True,
                                   cwd=Path(__file__).resolve().parents[1],check=False).stdout.strip()
         report = dict(status='running',source_run=str(run_dir),sam_inference_performed=False,
+                      cached_output_crs_overrides=cached_crs_overrides,
+                      crs_equivalence_confirmed=False,
                       source_manifest_sha256=digest(manifest_path),
                       source_windows_sha256=digest(records_path),cache_sha256=cache_hashes,
                       cache_integrity_scope='sizes, invariants, original output reproduction and log totals; '
@@ -159,6 +168,7 @@ def refusion(run_dir, output_dir, gt_path=None, methods=METHODS):
                                              output_dir=str(directory),fusion=method,
                                              gt=None if gt_path is None else str(gt_path))
                 derived.update(fusion=method,operation='cached_refusion',source_run=str(run_dir),
+                               cached_output_crs_overrides=cached_crs_overrides,
                                sam_inference_performed=False,source_inference_seconds=source.get('seconds'),
                                seconds=fusion_seconds,code_revision=revision,
                                source_manifest_sha256=report['source_manifest_sha256'],
