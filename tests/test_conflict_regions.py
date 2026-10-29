@@ -99,6 +99,12 @@ class RegionTests(unittest.TestCase):
                 bounded=replay(args.output_dir,root/'bounded',args.gt,radius=1)
             self.assertEqual(bounded['status'],'complete')
             self.assertEqual(len(bounded['evaluation']),6)
+            from experiments.report_regions import build
+            build(root/'bounded',args.gt,root/'visual_report',size=8,per_kind=1)
+            self.assertTrue((root/'visual_report'/'index.html').exists())
+            self.assertTrue((root/'visual_report'/'cases.json').exists())
+            with self.assertRaises(FileExistsError):
+                build(root/'bounded',args.gt,root/'visual_report')
             for method in ('conflict','random'):
                 old=bounded['evaluation'][method+'_unrestricted']['transitions_from_union']
                 new=bounded['evaluation'][method+'_boundary']['transitions_from_union']

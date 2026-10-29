@@ -56,6 +56,18 @@ python -m experiments.refine_conflicts --union-dir outputs/fusion/union --checkp
 训练来源独立性和CRS等价仍未确认，本阶段只作开发对照。判断效果需同时看全局IoU/Recall/PQ、原冲突域变化、一致域是否受损，以及实际处理调用和时间；不只挑一项提高。随机组主要检验定位作用；由于两组空间内容、实例数量和实际可接受候选不同，首次比较不能单独证明因果或泛化提升。
 # Offline diagnosis after inference
 
+## Visual audit of the completed boundary experiment
+
+```bash
+python -m experiments.report_regions --boundary-dir outputs/boundary2 --gt "$HOME/xy/data/qgis_label_result3/instance.tif" --output-dir outputs/region_report
+```
+
+This reads existing results and writes a six-method metric table plus visual examples to `index.html`, portable PNG panels, `cases.json` (coordinates, selection rule, counts and current input hashes), and `summary.txt`. Open `index.html` in a browser; keep its PNG files beside it. No inference or new packages are required. It validates original replay input hashes and rechecks raster metric counts against the saved evaluated report. It preserves sources and rejects existing output directories.
+
+Examples use a fixed crop-origin grid (default 256 pixels), ranked independently for harmful and correct boundary-constrained deletions in each arm; descending event count, ties by y then x, up to 2 per category. GT selection is explicitly post-hoc: these are illustrative extreme cases, not randomly representative evidence. Empty event categories produce no examples; a tile can appear in both categories. Use the fixed default selection for the next report, rather than searching for favorable examples.
+
+Panels show RGB, GT boundaries, union boundaries, unrestricted boundaries, constrained boundaries, and changes from union. Red denotes harmful deletions, green correct deletions, cyan correct additions, magenta false additions. Yellow denotes instance boundaries; non-ROI pixels are darkened in overlays. A summary table retains all six methods without selecting a best method or claiming independent-test performance. Future acceptance rules must use prediction information, not the GT used for this audit.
+
 ## Cached boundary-constrained update ablation
 
 From the Linux project root in `sam-exp`, replay the completed two-arm region experiment:
