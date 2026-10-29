@@ -11,6 +11,7 @@ from rasterio.transform import from_origin
 from experiments.tiles import fuse_result, source_ids, windows
 from experiments.run_tiles import run
 from experiments.evaluate_tiles import evaluate_run
+from experiments.refuse_tiles import refusion
 
 
 class TileTests(unittest.TestCase):
@@ -88,6 +89,67 @@ class TileTests(unittest.TestCase):
             self.assertFalse((args.output_dir/'summary.json').exists())
             with self.assertRaises(ValueError):
                 evaluate_run(args.output_dir,args.gt,args.eval_mask,False,0)
+
+    def test_cached_refusion_preserves_source_and_reproduces_center(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            args,_=self.fixture(root)
+            calls=[0]
+            def alternating(rgb,original,predictor,options):
+                calls[0]+=1
+                return (original.copy() if calls[0]%2 else np.zeros_like(original)),[]
+            run(args,refine=alternating)
+            before={p:p.read_bytes() for p in args.output_dir.rglob('*') if p.is_file()}
+            model_calls=calls[0]
+            result=refusion(args.output_dir,root/'fusion',args.gt)
+            self.assertEqual(result['status'],'complete')
+            self.assertFalse(result['sam_inference_performed'])
+            self.assertEqual(calls[0],model_calls)
+            arrays={}
+            for method in ('center','union','intersection','majority'):
+                with rasterio.open(root/'fusion'/method/'instance.tif') as src:
+                    arrays[method]=src.read(1)
+                self.assertTrue((root/'fusion'/method/'summary.json').exists())
+                self.assertTrue(set(np.unique(arrays[method])).issubset({0,17}))
+            with rasterio.open(args.output_dir/'instance.tif') as src:
+                np.testing.assert_equal(arrays['center'],src.read(1))
+            self.assertGreater(int((arrays['union']>0).sum()),int((arrays['intersection']>0).sum()))
+            self.assertTrue(np.all((arrays['intersection']>0)<=(arrays['majority']>0)))
+            self.assertTrue(np.all((arrays['majority']>0)<=(arrays['union']>0)))
+            self.assertGreater(result['stats']['scoring_conflict_pixels'],0)
+            self.assertTrue((root/'fusion'/'comparison.csv').exists())
+            for path,content in before.items():
+                self.assertEqual(path.read_bytes(),content)
+
+    def test_refusion_rejects_invalid_votes_and_missing_cache(self):
+        for defect in ('votes','missing'):
+            with self.subTest(defect=defect),tempfile.TemporaryDirectory() as folder:
+                root=Path(folder)
+                args,_=self.fixture(root)
+                run(args,refine=self.identity)
+                if defect=='missing':
+                    (args.output_dir/'work'/'center.bin').unlink()
+                else:
+                    array=np.memmap(args.output_dir/'work'/'votes.bin',mode='r+',dtype='uint32',shape=(12,12))
+                    array[0,0]=999
+                    array.flush()
+                    del array
+                with self.assertRaises(ValueError):
+                    refusion(args.output_dir,root/'fusion')
+                self.assertFalse((root/'fusion').exists())
+
+    def test_refusion_rejects_smoke_or_changed_baseline(self):
+        for defect in ('smoke','baseline'):
+            with self.subTest(defect=defect),tempfile.TemporaryDirectory() as folder:
+                root=Path(folder)
+                args,_=self.fixture(root,max_windows=1 if defect=='smoke' else 0)
+                run(args,refine=self.identity)
+                if defect=='baseline':
+                    with rasterio.open(args.prediction,'r+') as dst:
+                        dst.write(np.zeros((12,12),dtype='uint16'),1)
+                with self.assertRaises(ValueError):
+                    refusion(args.output_dir,root/'fusion')
+                self.assertFalse((root/'fusion').exists())
 
 
 if __name__=='__main__':
