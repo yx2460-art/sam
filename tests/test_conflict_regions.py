@@ -88,6 +88,28 @@ class RegionTests(unittest.TestCase):
             self.assertEqual(report['status'],'complete')
             self.assertTrue((args.output_dir/'comparison.csv').exists())
             self.assertEqual(report['processed_regions'],2)
+            from experiments.constrain_regions import run as replay
+            second_snapshot={p:p.read_bytes() for p in args.output_dir.rglob('*') if p.is_file()}
+            def replay_open(path,*a,**kw):
+                if Path(path).resolve()==args.gt.resolve():
+                    self.assertTrue((root/'bounded'/'conflict'/'instance.tif').exists())
+                    self.assertTrue((root/'bounded'/'random'/'instance.tif').exists())
+                return actual_open(path,*a,**kw)
+            with patch('rasterio.open',side_effect=replay_open):
+                bounded=replay(args.output_dir,root/'bounded',args.gt,radius=1)
+            self.assertEqual(bounded['status'],'complete')
+            self.assertEqual(len(bounded['evaluation']),6)
+            for method in ('conflict','random'):
+                old=bounded['evaluation'][method+'_unrestricted']['transitions_from_union']
+                new=bounded['evaluation'][method+'_boundary']['transitions_from_union']
+                for key in ('removed_true_foreground','removed_false_foreground','added_true_foreground','added_false_foreground'):
+                    self.assertLessEqual(new[key],old[key])
+                self.assertLessEqual(bounded['results'][method]['retained_changed_pixels'],
+                                     bounded['results'][method]['unrestricted_changed_pixels'])
+            for path,data in second_snapshot.items():
+                self.assertEqual(path.read_bytes(),data)
+            with self.assertRaises(FileExistsError):
+                replay(args.output_dir,root/'bounded',args.gt)
             from experiments.diagnose_regions import diagnose
             diagnostic=diagnose(args.output_dir,args.gt,root/'diagnosis')
             for method in ('conflict','random'):

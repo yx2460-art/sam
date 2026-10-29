@@ -56,6 +56,22 @@ python -m experiments.refine_conflicts --union-dir outputs/fusion/union --checkp
 训练来源独立性和CRS等价仍未确认，本阶段只作开发对照。判断效果需同时看全局IoU/Recall/PQ、原冲突域变化、一致域是否受损，以及实际处理调用和时间；不只挑一项提高。随机组主要检验定位作用；由于两组空间内容、实例数量和实际可接受候选不同，首次比较不能单独证明因果或泛化提升。
 # Offline diagnosis after inference
 
+## Cached boundary-constrained update ablation
+
+From the Linux project root in `sam-exp`, replay the completed two-arm region experiment:
+
+```bash
+python -m experiments.constrain_regions --run-dir outputs/region --gt "$HOME/xy/data/qgis_label_result3/instance.tif" --radius 2 --output-dir outputs/boundary2
+```
+
+The radius is fixed at 2 pixels for this next development experiment; do not choose a radius by inspecting GT performance and then call that an independent test. No model or checkpoint is loaded. The cached final two-arm rasters encode the accepted second-stage candidates and fallback decisions; replay restricts those existing updates instead of reinterpreting raw patch predictions.
+
+The allowed write mask is the intersection of the original planned arm mask, fixed evaluation ROI, and a band around **union instance-label boundaries** (four-neighbor transitions, Chebyshev radius). It includes touching-instance boundaries as well as foreground/background edges. The band is computed before ROI/write masking and is never recomputed from the updated raster. Since pixels outside the cached crop are unavailable, the outer radius+1 pixels of the crop are protected equally for both arms. Predicted interiors outside the band retain union values. The same radius is used for conflict and random arms; intersected write areas and actual modification counts can differ and are reported, not claimed to be equal budgets.
+
+Outputs include `boundary_band.tif`, each arm's `allowed_write.tif` and `instance.tif`, `comparison.csv`, `report.json`, and a short `summary.txt`. Evaluation compares BsiNet, union, both unrestricted cached results, and both constrained results on the original fixed ROI. It reports IoU, boundary F1, instance F1, PQ, and gross harmful/correct deletions and additions relative to union. GT is opened only after both constrained outputs are saved; it never determines update masks. Source files remain unchanged, existing output directories are rejected, source hashes and original update counts are checked. Current candidate hashes are snapshots rather than historical seals. Use a new output directory for each run; a failed evaluation can leave saved outputs but no completed report.
+
+This is a post-hoc development ablation, not a validated improvement or publication novelty claim. Reducing the number of permitted changes mechanically reduces both harmful and beneficial changes; judge final quality and retained corrections as well as deletion counts. Fixed BsiNet IDs still prevent discovering or splitting instances, and training independence remains unverified.
+
 For an existing `outputs/diagnosis/changes.csv`, extract location counts without reopening rasters or running inference:
 
 ```bash
