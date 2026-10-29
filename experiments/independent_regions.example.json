@@ -1,0 +1,11 @@
+{
+  "reference": null,
+  "checkpoint": null,
+  "training_provenance": null,
+  "all_training_footprints_declared": false,
+  "train_mask": null,
+  "validation_mask": null,
+  "test_mask": null,
+  "buffer_pixels": 256,
+  "notes": "Pending actual checkpoint training provenance and manually defined binary region masks. Do not substitute guessed training coverage or reuse the repeatedly inspected development ROI as an independent test. Paths are relative to this config file unless absolute."
+}

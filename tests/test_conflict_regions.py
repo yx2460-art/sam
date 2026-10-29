@@ -99,6 +99,10 @@ class RegionTests(unittest.TestCase):
                 bounded=replay(args.output_dir,root/'bounded',args.gt,radius=1)
             self.assertEqual(bounded['status'],'complete')
             self.assertEqual(len(bounded['evaluation']),6)
+            from experiments.audit_instances import run as audit_instances
+            audited=audit_instances(root/'bounded',args.gt,root/'instance_audit')
+            self.assertEqual(len(audited['methods']),6)
+            self.assertTrue((root/'instance_audit'/'instances.csv').exists())
             from experiments.report_regions import build
             build(root/'bounded',args.gt,root/'visual_report',size=8,per_kind=1)
             self.assertTrue((root/'visual_report'/'index.html').exists())
