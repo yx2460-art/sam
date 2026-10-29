@@ -169,6 +169,8 @@ def diagnose(run_dir, gt_path, output_dir, radius=2):
     text='\n'.join(lines)+'\n'
     (output_dir/'summary.txt').write_text(text,encoding='utf-8')
     print(text)
+    from .summarize_regions import summarize
+    summarize(output_dir)
     return result
 
 

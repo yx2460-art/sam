@@ -56,6 +56,14 @@ python -m experiments.refine_conflicts --union-dir outputs/fusion/union --checkp
 训练来源独立性和CRS等价仍未确认，本阶段只作开发对照。判断效果需同时看全局IoU/Recall/PQ、原冲突域变化、一致域是否受损，以及实际处理调用和时间；不只挑一项提高。随机组主要检验定位作用；由于两组空间内容、实例数量和实际可接受候选不同，首次比较不能单独证明因果或泛化提升。
 # Offline diagnosis after inference
 
+For an existing `outputs/diagnosis/changes.csv`, extract location counts without reopening rasters or running inference:
+
+```bash
+python -m experiments.summarize_regions --diagnosis-dir outputs/diagnosis
+```
+
+This writes `location_summary.txt` and prints its contents. Existing summaries are protected against overwrite. New `diagnose_regions` runs also generate this summary automatically. It reports both the share of all harmful deletions and harmful deletions divided by the entire location area; the latter is not a true-foreground-conditioned error rate. Compare near/away groups within each classification. Their areas may differ. Boundary/edge associations are descriptive and do not establish causation or an inference-time update rule.
+
 Run from the Linux project root with the existing `sam-exp` environment:
 
 ```bash
