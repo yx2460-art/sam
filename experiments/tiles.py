@@ -3,14 +3,19 @@ import numpy as np
 from rasterio.windows import Window
 
 
-def windows(width, height, size, stride, bounds):
+def windows(width, height, size, stride, bounds, offset_x=0, offset_y=0):
     if size <= 0 or not 0 < stride <= size:
         raise ValueError('Require 0 < stride <= tile size')
+    if not (0 <= offset_x < stride and 0 <= offset_y < stride):
+        raise ValueError('Require 0 <= each grid offset < stride')
     x0, y0, x1, y1 = bounds
-    for y in range(0, height, stride):
-        for x in range(0, width, stride):
-            w, h = min(size, width-x), min(size, height-y)
-            if x < x1 and x+w > x0 and y < y1 and y+h > y0:
+    # Retain historical zero-origin behavior. A shifted leading window is clipped
+    # to the raster, covering the image edge without shifting any input pixels.
+    for raw_y in range(offset_y-stride if offset_y else 0, height, stride):
+        for raw_x in range(offset_x-stride if offset_x else 0, width, stride):
+            x,y=max(0,raw_x),max(0,raw_y)
+            w,h=min(width,raw_x+size)-x,min(height,raw_y+size)-y
+            if w>0 and h>0 and x < x1 and x+w > x0 and y < y1 and y+h > y0:
                 yield Window(x, y, w, h)
 
 

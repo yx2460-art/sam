@@ -36,6 +36,8 @@ def digest(path):
 
 
 def run(args, refine=None, predictor=None):
+    args.offset_x=getattr(args,'offset_x',0)
+    args.offset_y=getattr(args,'offset_y',0)
     if args.output_dir.exists():
         raise FileExistsError(f'Use a new output directory: {args.output_dir}')
     if args.context < 0 or args.max_windows < 0:
@@ -59,7 +61,8 @@ def run(args, refine=None, predictor=None):
         if any(image.dtypes[b-1] != 'uint8' for b in bands) and args.rgb_range is None:
             raise ValueError('Non-UInt8 RGB requires --rgb-range LOW HIGH')
         selected_bounds = mask_bounds(roi, args.context)
-        planned = list(windows(image.width, image.height, args.tile_size, args.stride, selected_bounds))
+        planned = list(windows(image.width, image.height, args.tile_size, args.stride, selected_bounds,
+                               args.offset_x,args.offset_y))
         if not planned:
             raise ValueError('No windows')
         if args.max_windows:
@@ -94,7 +97,7 @@ def run(args, refine=None, predictor=None):
         parameters = {k:str(v) if isinstance(v, Path) else v for k,v in vars(args).items()}
         revision = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=Path(__file__).resolve().parents[1],
                                   text=True, capture_output=True, check=False)
-        manifest = dict(status='running', parameters=parameters, grid_origin=[0,0],
+        manifest = dict(status='running', parameters=parameters, grid_origin=[args.offset_x,args.offset_y],
                         crop_xyxy=[x0,y0,x1,y1], planned_windows=len(planned),
                         requested_windows=len(used), crs_overrides=overrides,
                         inference_ground_truth_used=False, eval_mask_used='window extent only, not prompts',
@@ -210,6 +213,8 @@ def main():
         p.add_argument('--'+name,type=Path,required=True)
     p.add_argument('--tile-size',type=int,required=True)
     p.add_argument('--stride',type=int,required=True)
+    p.add_argument('--offset-x',type=int,default=0)
+    p.add_argument('--offset-y',type=int,default=0)
     p.add_argument('--context',type=int,default=1024,help='Fixed ROI bbox expansion for all scales')
     p.add_argument('--max-windows',type=int,default=0,help='Positive=smoke only, no metrics')
     p.add_argument('--fusion',choices=['center','union','intersection','majority'],default='center')

@@ -32,6 +32,8 @@ def read_json(path):
 def compatible(manifest,parameters,hashes,tile,stride,prompt):
     if manifest.get('status')!='complete' or manifest.get('source_run'):
         return False
+    if manifest.get('grid_origin')!=[0,0]:
+        return False
     p=manifest['parameters']
     if p.get('max_windows')!=0 or p.get('tile_size')!=tile or p.get('stride')!=stride:
         return False
@@ -119,6 +121,8 @@ def sweep(template_run,gt_path,output_dir,plan_only=False,reuse_root=None,runner
     template=read_json(template_run/'manifest.json')
     if template.get('status')!='complete' or template.get('fusion')!='center' or template.get('source_run'):
         raise ValueError('Template must be a complete original center-fusion window run')
+    if template.get('grid_origin')!=[0,0]:
+        raise ValueError('Dense stride experiment requires zero grid offsets')
     parameters={k:template['parameters'][k] for k in (*PATH_KEYS,*FIXED_KEYS)}
     for key in PATH_KEYS:
         parameters[key]=str(Path(parameters[key]).resolve())
