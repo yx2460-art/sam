@@ -100,7 +100,7 @@ def run(args, refine=None, predictor=None):
                         inference_ground_truth_used=False, eval_mask_used='window extent only, not prompts',
                         instance_identity='fixed BsiNet source ID; no new parcel split',
                         fusion=args.fusion, code_revision=revision.stdout.strip(),
-                        hashes={k:digest(v) for k,v in [('eval_mask',args.eval_mask),
+                        hashes={k:digest(v) for k,v in [('image',args.image),('coverage',args.coverage),('eval_mask',args.eval_mask),
                                                       ('prediction',args.prediction),('checkpoint',args.checkpoint)]},
                         versions={'numpy':np.__version__, 'rasterio':rasterio.__version__})
         def manifest_write():
