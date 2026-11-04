@@ -38,6 +38,50 @@ class RegionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             random_controls(regions,domain,domain,domain,1,attempts=5)
 
+    def test_context_scales_keep_centers_and_writes_and_open_gt_last(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            args=self.fixture(root)
+            args.context_sizes=[8,16]
+            seen=[]
+            def refine(rgb,original,predictor,options):
+                seen.append(rgb.shape[:2])
+                return np.zeros_like(original),[dict(source_id=1,component=1,
+                                                      accepted_count=1,prompt_count=1)]
+            actual_open=rasterio.open
+            def checked_open(path,*a,**kw):
+                if Path(path).resolve()==args.gt.resolve():
+                    self.assertEqual(len(seen),8)
+                return actual_open(path,*a,**kw)
+            with patch('rasterio.open',side_effect=checked_open):
+                report=run_conflicts(args,refine=refine)
+            self.assertEqual(seen,[(8,8)]*4+[(16,16)]*4)
+            with rasterio.open(args.union_dir/'instance.tif') as src:
+                initial=src.read(1)
+            for arm in ('conflict','random'):
+                logs=[]
+                with rasterio.open(args.output_dir/f'{arm}_write.tif') as src:
+                    allowed=src.read(1)>0
+                for size in args.context_sizes:
+                    directory=args.output_dir/f'{arm}_s{size}'
+                    logs.append(json.loads((directory/'patches.json').read_text()))
+                    with rasterio.open(directory/'instance.tif') as src:
+                        self.assertFalse(np.any((src.read(1)!=initial)&~allowed))
+                for small,large in zip(*logs):
+                    for axis,dimension in (('x_full','context_width'),('y_full','context_height')):
+                        self.assertEqual(small[axis]+small[dimension]/2,
+                                         large[axis]+large[dimension]/2)
+                    self.assertEqual(small['requested_write_pixels'],large['requested_write_pixels'])
+            self.assertEqual(len(report['evaluation']),6)
+            self.assertEqual(len(report['write_evaluation']['conflict']),6)
+            self.assertTrue((args.output_dir/'summary.txt').is_file())
+
+    def test_invalid_context_sizes_fail_before_opening_inputs(self):
+        for sizes in ([8],[8,8],[6,16],[8,15]):
+            args=SimpleNamespace(context_sizes=sizes,core_size=8)
+            with self.assertRaises(ValueError):
+                run_conflicts(args)
+
     def fixture(self,root):
         profile=dict(driver='GTiff',width=32,height=32,count=1,dtype='uint16',
                      crs='EPSG:32648',transform=from_origin(100,200,1,1))

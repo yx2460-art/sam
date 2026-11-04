@@ -33,6 +33,11 @@ def save_mask(path,mask,profile):
 
 
 def run(args,refine=None,predictor=None):
+    context_sizes=getattr(args,'context_sizes',None)
+    if context_sizes is not None:
+        if (len(context_sizes)<2 or len(set(context_sizes))!=len(context_sizes)
+                or any(s<args.core_size or (s-context_sizes[0])%2 for s in context_sizes)):
+            raise ValueError('Use at least two distinct context sizes >= core-size, with equal parity')
     if args.output_dir.exists():
         raise FileExistsError(f'Use a new directory: {args.output_dir}')
     if args.context<0 or args.seed<0:
@@ -111,6 +116,9 @@ def run(args,refine=None,predictor=None):
             raise ValueError('Write budgets are not equal')
         args.output_dir.mkdir(parents=True)
         plans={'conflict':regions,'random':random_regions}
+        if context_sizes:
+            plans={f'{arm}_s{size}':items for size in context_sizes
+                   for arm,items in (('conflict',regions),('random',random_regions))}
         report=dict(status='planned',ground_truth_used_for_planning_or_inference=False,
                     source_union=str(union_dir),source_union_sha256=digest(union_dir/'instance.tif'),
                     source_manifest_sha256=digest(manifest_path),
@@ -125,11 +133,20 @@ def run(args,refine=None,predictor=None):
                              'actual decoder calls/time are reported, not guaranteed equal',
                     scope='fixed BsiNet IDs, no new instance discovery or splitting; developer ROI only',
                     results={})
+        report['context_sizes']=context_sizes
+        report['context_protocol']='Same planned masks and centers across scales; raw image reads; fixed source IDs. '
+        report['context_protocol']+='Context may change components, prompts and acceptance; not equal decoder budgets.'
         plan_json={}
         for method,items in plans.items():
             plan_json[method]=[dict(x_full=x0+r['x'],y_full=y0+r['y'],
                                     width=r['mask'].shape[1],height=r['mask'].shape[0],
                                     write_pixels=int(r['mask'].sum())) for r in items]
+            if context_sizes:
+                size=int(method.rsplit('_s',1)[1])
+                for row in plan_json[method]:
+                    row.update(context_x_full=row['x_full']-(size-row['width'])//2,
+                               context_y_full=row['y_full']-(size-row['height'])//2,
+                               context_width=size,context_height=size)
         report['plans']=plan_json
         (args.output_dir/'plan.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
         save_mask(args.output_dir/'conflict.tif',conflict,profile)
@@ -166,8 +183,14 @@ def run(args,refine=None,predictor=None):
                 x,y=region['x'],region['y']
                 h,w=region['mask'].shape
                 # Fixed context dimensions; boundless reads keep edge budgets matched.
-                context=Window(x0+x-args.context,y0+y-args.context,
-                               w+2*args.context,h+2*args.context)
+                if context_sizes:
+                    size=int(method.rsplit('_s',1)[1])
+                    pad_x,pad_y=(size-w)//2,(size-h)//2
+                    context=Window(x0+x-pad_x,y0+y-pad_y,size,size)
+                else:
+                    pad_x=pad_y=args.context
+                    context=Window(x0+x-pad_x,y0+y-pad_y,
+                                   w+2*pad_x,h+2*pad_y)
                 rgb=image.read(bands,window=context,boundless=True,fill_value=0)
                 ok=np.all(image.read_masks(bands,window=context,boundless=True)>0,axis=0)
                 ok &= coverage.read(1,window=context,boundless=True,fill_value=0)>0
@@ -192,7 +215,7 @@ def run(args,refine=None,predictor=None):
                     if lab not in component_cache:
                         component_cache[lab]=ndimage.label(original==lab,structure=np.ones((3,3)))[0]
                     accepted_components |= component_cache[lab]==record['component']
-                core=np.s_[args.context:args.context+h,args.context:args.context+w]
+                core=np.s_[pad_y:pad_y+h,pad_x:pad_x+w]
                 # A fallback to the old BsiNet mask is NOT a successful refinement:
                 # retain union pixels for any source ID with no accepted candidate.
                 update=region['mask']&accepted_components[core]&ok[core]
@@ -206,7 +229,7 @@ def run(args,refine=None,predictor=None):
                                  eligible_write_pixels=int(update.sum()),seconds=time.perf_counter()-tick,
                                  objects=details))
                 print(f'{method} region {i+1}/{len(items)}: eligible write {int(update.sum())}',flush=True)
-            method_write=conflict_write if method=='conflict' else random_write
+            method_write=conflict_write if method.startswith('conflict') else random_write
             if np.any((result!=initial)&~method_write):
                 raise ValueError('Unexpected write outside the planned region')
             save_labels(directory/'instance.tif',result,profile)
@@ -240,6 +263,13 @@ def run(args,refine=None,predictor=None):
                 report.setdefault('evaluation',{})[name]=entry
                 rows.append(dict(method=name,seconds=report['results'].get(name,{}).get('seconds',0),
                                  **scores(counts)))
+                if context_sizes:
+                    from .diagnose_regions import transitions
+                    entry['transitions_from_union']=transitions(initial,data,target,domain)
+                    for arm,mask in (('conflict',conflict_write),('random',random_write)):
+                        local_counts=roi_counts(data,target,mask,params.get('boundary_tolerance',2))
+                        report.setdefault('write_evaluation',{}).setdefault(arm,{})[name]=dict(
+                            scores(local_counts),counts=local_counts)
                 # Fixed ORIGINAL conflict domain, not a method-dependent post-hoc ROI.
                 local_counts=roi_counts(data,target,conflict,params.get('boundary_tolerance',2))
                 report.setdefault('conflict_evaluation',{})[name]=dict(scores(local_counts),counts=local_counts)
@@ -256,11 +286,23 @@ def run(args,refine=None,predictor=None):
         if digest(union_dir/'instance.tif')!=report['source_union_sha256']:
             raise ValueError('Source union changed during experiment')
         (args.output_dir/'report.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
+        if context_sizes:
+            lines=['Centered raw-image context comparison; developer ROI only; GT opened after all inference.',
+                   'Same write masks at each scale; fixed BsiNet IDs; no new instances or splitting.',
+                   'Larger context may change prompt count and accepted components; inspect patches.json.']
+            for name,entry in report.get('evaluation',{}).items():
+                changes=entry['transitions_from_union']
+                lines.append(f"{name}: IoU={entry['mask_iou']:.6f}, boundary_F1={entry['boundary_f1']:.6f}, "
+                             f"instance_F1={entry['instance_f1']:.6f}, PQ={entry['pq']:.6f}, "
+                             f"harmful_removals={changes['removed_true_foreground']}, "
+                             f"correct_removals={changes['removed_false_foreground']}")
+            (args.output_dir/'summary.txt').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+            print('\n'.join(lines),flush=True)
         print(f'Complete; saved {args.output_dir}',flush=True)
         return report
 
 
-def main():
+def main(default_context_sizes=None):
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--union-dir',type=Path,required=True)
     p.add_argument('--checkpoint',type=Path,required=True)
@@ -269,6 +311,8 @@ def main():
     p.add_argument('--device',default='cuda:0')
     p.add_argument('--core-size',type=int,default=256)
     p.add_argument('--context',type=int,default=128)
+    p.add_argument('--context-sizes',type=int,nargs='+',default=default_context_sizes,
+                   help='Compare fixed square raw-image contexts on identical write masks; overrides --context')
     p.add_argument('--write-buffer',type=int,default=8)
     p.add_argument('--min-conflict',type=int,default=32)
     p.add_argument('--max-regions',type=int,default=16)
