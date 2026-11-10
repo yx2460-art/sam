@@ -1,0 +1,119 @@
+import json
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+
+from experiments.run_tiles import digest
+from experiments.split_instances import prepare,infer,apply,evaluate,split_candidate
+
+
+class Predictor:
+    model=SimpleNamespace(mask_threshold=0)
+    def __init__(self,ambiguous=False): self.ambiguous=ambiguous
+    def set_image(self,rgb): self.shape=rgb.shape[:2]
+    def predict(self,point_coords,point_labels,box,**kwargs):
+        assert list(point_labels)==[1]
+        raw=np.full(self.shape,-5,dtype=float)
+        yy,xx=np.indices(self.shape);middle=(box[1]+box[3])/2
+        mask=(xx>=box[0])&(xx<=box[2])&(yy>=box[1])&(yy<=box[3])
+        if not self.ambiguous:
+            mask &= (yy<=middle) if point_coords[0,1]<=middle else (yy>middle)
+        raw[mask]=5
+        return np.array([raw]),np.array([.95]),None
+
+
+class SplitTests(unittest.TestCase):
+    def fixture(self,root):
+        labels=np.zeros((24,24),dtype=np.uint32);labels[3:21,3:12]=1;labels[3:21,12:21]=2
+        truth=labels.copy();truth[3:12,3:12]=10;truth[12:21,3:12]=11
+        truth[3:12,12:21]=12;truth[12:21,12:21]=13
+        profile=dict(driver='GTiff',width=24,height=24,count=1,dtype='uint32',transform=from_origin(100,200,1,1),crs='EPSG:32648')
+        for name,data in [('instances',labels),('gt',truth),('roi',(labels>0).astype(np.uint32))]:
+            with rasterio.open(root/f'{name}.tif','w',**profile) as dst:dst.write(data,1)
+        with rasterio.open(root/'image.tif','w',**dict(profile,count=3,dtype='uint8')) as dst:
+            dst.write(np.full((3,24,24),100,dtype=np.uint8))
+        (root/'weights.pth').write_bytes(b'synthetic')
+        return labels
+
+    def test_positive_only_rejects_indistinguishable_masks_and_bad_points(self):
+        mask=np.ones((20,20),dtype=bool);rgb=np.zeros((20,20,3),dtype=np.uint8)
+        proposal,detail=split_candidate(rgb,mask,[[5,3],[5,16]],Predictor(True),min_area=3)
+        self.assertIsNone(proposal)
+        self.assertIn('cannot separate',detail['reason'])
+        for points in ([[5,3],[5,3]],[[30,3],[5,16]],[[5.5,3],[5,16]]):
+            with self.assertRaises(ValueError):split_candidate(rgb,mask,points,Predictor(),3)
+
+    def test_full_instance_new_ids_approval_and_overlapping_contexts_preserve_other_objects(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);original=self.fixture(root);snapshot=(root/'instances.tif').read_bytes()
+            actual=rasterio.open
+            def no_gt(path,*args,**kwargs):
+                self.assertNotEqual(Path(path).resolve(),(root/'gt.tif').resolve())
+                return actual(path,*args,**kwargs)
+            with patch('rasterio.open',side_effect=no_gt):
+                m=prepare(root/'image.tif',root/'instances.tif',root/'project',roi_path=root/'roi.tif',pad=2)
+                self.assertEqual([r['source_pixels'] for r in m['regions']],[162,162])
+                points=[]
+                for row in m['regions']:
+                    x0,y0,_,_=row['xyxy'];x=6 if row['id']==1 else 17
+                    points.append(dict(id=row['id'],points=[[x-x0,6-y0],[x-x0,17-y0]]))
+                (root/'points.json').write_text(json.dumps(dict(project_sha256=digest(root/'project'/'project.json'),instances=points)))
+                proposals=infer(root/'project',root/'points.json',root/'weights.pth',root/'proposals',min_area=4,predictor=Predictor())
+                self.assertTrue(all(p['status']=='proposal' for p in proposals['proposals']))
+                if shutil.which('node'):
+                    check=r'''
+const fs=require('fs'),vm=require('vm'),assert=require('assert');const pages=JSON.parse(fs.readFileSync(0,'utf8'));
+function harness(page){const nodes={},canvases=[...page.matchAll(/<canvas id="([^"]+)" width="(\d+)" height="(\d+)"/g)];
+canvases.forEach(m=>nodes[m[1]]={width:+m[2],height:+m[3],getBoundingClientRect:()=>({left:0,top:0,width:+m[2]*10,height:+m[3]*10}),getContext:()=>({drawImage(){},beginPath(){},arc(){},fill(){},fillText(){}})});
+let payload;const c={Date,JSON,Object,Math,Image:class{set src(v){this.onload();}},alert:()=>{throw Error('Unexpected alert');},
+Blob:class{constructor(parts){payload=JSON.parse(parts.join(''));}},URL:{createObjectURL:()=>'',revokeObjectURL:()=>{}},setTimeout:fn=>fn(),
+document:{getElementById:id=>nodes[id]||(nodes[id]={checked:false}),createElement:()=>({click(){}})}};
+vm.createContext(c);vm.runInContext(page.match(/<script>([\s\S]*?)<\/script>/)[1],c);return {c,nodes,get:()=>payload};}
+const points=harness(pages[0]);points.nodes.c1.onclick({clientX:55,clientY:55});points.nodes.c1.onclick({clientX:55,clientY:165});points.c.download();
+assert.deepEqual(points.get().instances,[{id:1,points:[[5,5],[5,16]]}]);points.c.undo(1);assert(points.nodes.s1.textContent.startsWith('1 '));
+const review=harness(pages[1]);review.c.download();assert.deepEqual(review.get().accepted_ids,[]);
+review.nodes.a1.checked=true;review.c.download();assert.deepEqual(review.get().accepted_ids,[1]);
+'''
+                    checked=subprocess.run(['node','-e',check],input=json.dumps([
+                        (root/'project'/'index.html').read_text(encoding='utf-8'),
+                        (root/'proposals'/'review.html').read_text(encoding='utf-8')]),
+                        text=True,encoding='utf-8',capture_output=True)
+                    self.assertEqual(checked.returncode,0,checked.stderr)
+                approve=dict(proposals_sha256=digest(root/'proposals'/'proposals.json'),accepted_ids=[1,2])
+                (root/'approvals.json').write_text(json.dumps(approve))
+                result=apply(root/'proposals',root/'approvals.json',root/'result')
+                with actual(root/'result'/'instance.tif') as src:
+                    output=src.read(1);self.assertEqual(src.shape,original.shape)
+                np.testing.assert_equal(output>0,original>0)
+                self.assertEqual(set(np.unique(output)),{0,3,4,5,6})
+                self.assertEqual(len(result['accepted']),2)
+                approve['accepted_ids']=[1];(root/'approvals.json').write_text(json.dumps(approve))
+                apply(root/'proposals',root/'approvals.json',root/'one')
+                with actual(root/'one'/'instance.tif') as src:one=src.read(1)
+                np.testing.assert_equal(one[original==2],original[original==2])
+                approve['accepted_ids']=[];(root/'approvals.json').write_text(json.dumps(approve))
+                apply(root/'proposals',root/'approvals.json',root/'cancel')
+                with actual(root/'cancel'/'instance.tif') as src:np.testing.assert_equal(src.read(1),original)
+            metrics=evaluate(root/'result',root/'gt.tif',root/'roi.tif',root/'eval',tolerance=0)
+            self.assertEqual(metrics['evaluation']['after']['mask_iou'],1)
+            self.assertGreater(metrics['evaluation']['after']['instance_f1'],metrics['evaluation']['before']['instance_f1'])
+            self.assertEqual(snapshot,(root/'instances.tif').read_bytes())
+            with (root/'proposals'/'1_proposal.tif').open('ab') as stream:stream.write(b'tampered')
+            with self.assertRaises(ValueError):apply(root/'proposals',root/'approvals.json',root/'invalid')
+
+    def test_large_context_rejected_without_truncation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);self.fixture(root)
+            with self.assertRaises(ValueError):prepare(root/'image.tif',root/'instances.tif',root/'project',ids=[1],pad=2,max_side=5)
+            self.assertFalse((root/'project').exists())
+
+
+if __name__=='__main__':unittest.main()
