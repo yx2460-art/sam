@@ -108,7 +108,9 @@ def prepare(run_dir,output_dir,size=256):
                      '<option value="keep">保留当前结果</option><option value="intersection">求交</option>'
                      '<option value="union">求并</option></select></label> '
                      f'<button onclick="review({i})">确认已查看此区域</button> '
-                     f'<span id="state{i}">尚未查看，默认保留</span></section>')
+                     f'<span id="state{i}">尚未查看，默认保留</span>'
+                     f'<figure><img id="preview{i}" src="region_{i}_center.png">'
+                     '<figcaption>当前选择预览（导出决策后需运行 apply 生成GeoTIFF）</figcaption></figure></section>')
     overview_svg=f'<svg viewBox="0 0 {ow} {oh}" style="width:min(100%,1000px)"><image href="overview.png" width="{ow}" height="{oh}"/>'
     for r in rows:
         overview_svg+=(f'<a href="#r{r["id"]}"><rect x="{r["x"]*ow/domain.shape[1]}" '
@@ -121,14 +123,25 @@ def prepare(run_dir,output_dir,size=256):
 const config=CONFIG, key='manual-fusion-'+config.project_sha256;
 let decisions=Object.fromEntries(config.regions.map(id=>[id,{id,choice:'keep',reviewed:false,changes:0}]));
 let sessions=[], events=[], started=Date.now();
-try {const saved=JSON.parse(localStorage.getItem(key));if(saved){decisions=saved.decisions;sessions=saved.sessions||[];events=saved.events||[];}}catch(e){}
-function store(){try{localStorage.setItem(key,JSON.stringify({decisions,sessions,events}));}catch(e){}}
+function validate(rows){if(!Array.isArray(rows)||rows.length!==config.regions.length)throw Error('区域数量不匹配');
+const seen=new Set();for(const d of rows){if(!config.regions.includes(d.id)||seen.has(d.id)||
+!['keep','union','intersection'].includes(d.choice)||typeof d.reviewed!=='boolean'||(!d.reviewed&&d.choice!=='keep'))throw Error('决策无效或区域重复');seen.add(d.id);}}
+try {const saved=JSON.parse(localStorage.getItem(key));if(saved){validate(Object.values(saved.decisions));decisions=saved.decisions;sessions=saved.sessions||[];events=saved.events||[];}}catch(e){}
+function store(){try{localStorage.setItem(key,JSON.stringify({decisions,sessions,events}));}catch(e){document.getElementById('message').textContent='浏览器无法保存本地进度，请导出JSON备份。';}}
 function show(id){const d=decisions[id];document.getElementById('choice'+id).value=d.choice;
-document.getElementById('state'+id).textContent=d.reviewed?'已确认':'尚未查看，默认保留';}
+document.getElementById('state'+id).textContent=d.reviewed?'已确认':'尚未查看，默认保留';
+document.getElementById('preview'+id).src='region_'+id+'_'+(d.choice==='keep'?'center':d.choice)+'.png';
+const all=Object.values(decisions);document.getElementById('progress').textContent='已查看 '+all.filter(r=>r.reviewed).length+'/'+all.length+'，选择修改 '+all.filter(r=>r.choice!=='keep').length+' 个区域';}
 function record(id){const d=decisions[id];d.choice=document.getElementById('choice'+id).value;
 d.reviewed=true;d.changes++;d.last_action_utc=new Date().toISOString();events.push({id,action:'choose',choice:d.choice,utc:d.last_action_utc});show(id);store();}
 function review(id){decisions[id].reviewed=true;decisions[id].last_action_utc=new Date().toISOString();events.push({id,action:'review',utc:decisions[id].last_action_utc});show(id);store();}
-function jump(){const id=document.getElementById('jump').value;location.hash='r'+id;}
+function jump(){const id=Number(document.getElementById('jump').value);if(!config.regions.includes(id)){document.getElementById('message').textContent='不存在该区域ID';return;}location.hash='r'+id;}
+async function restore(file){if(!file)return;try{const data=JSON.parse(await file.text());
+if(data.project_sha256!==config.project_sha256)throw Error('JSON来自其他选择项目');validate(data.decisions);
+if(!Array.isArray(data.session_wall_seconds)||data.session_wall_seconds.some(v=>!Number.isFinite(v)||v<0)||!Array.isArray(data.events))throw Error('操作记录格式无效');
+decisions=Object.fromEntries(data.decisions.map(d=>[d.id,d]));sessions=data.session_wall_seconds;events=data.events;started=Date.now();
+config.regions.forEach(show);store();document.getElementById('message').textContent='已从JSON恢复进度';
+}catch(e){document.getElementById('message').textContent='导入失败：'+e.message;}}
 function download(){const elapsed=(Date.now()-started)/1000;sessions.push(elapsed);started=Date.now();store();
 const payload={project_sha256:config.project_sha256,decisions:config.regions.map(id=>decisions[id]),
 session_wall_seconds:sessions,events,exported_utc:new Date().toISOString(),timing_note:'Browser wall time includes pauses; self-reported, not verified active work'};
@@ -143,6 +156,9 @@ config.regions.forEach(show);
 未查看区域保留当前中心优先结果。每个区域独立选择，可反复修改；完成后导出决策。</p>
 区域ID <input id="jump" type="number" min="0" value="0"><button onclick="jump()">定位区域</button>
 <button onclick="download()">导出 decisions.json</button></header><p>点击总览中的黄色网格定位区域：</p>'''+overview_svg+''.join(cards)+'<script>'+script+'</script></html>'
+    document=document.replace('</header>',
+        '<label>恢复决策JSON <input type="file" accept=".json" onchange="restore(this.files[0])"></label>'
+        '<p id="progress"></p><p id="message" role="status"></p></header>')
     (output_dir/'index.html').write_text(document,encoding='utf-8')
     print(f'Ready: {output_dir}/index.html; {len(rows)} regions. No GT read, no SAM inference.')
     return manifest
@@ -158,6 +174,11 @@ def apply(project,decisions_path,output_dir):
     if choices.get('project_sha256')!=digest(project/'project.json'):
         raise ValueError('Decisions belong to another project')
     records=choices.get('decisions',[])
+    timing=choices.get('session_wall_seconds',[])
+    events=choices.get('events',[])
+    if (not isinstance(timing,list) or any(type(t) not in (int,float) or not np.isfinite(t) or t<0 for t in timing)
+            or not isinstance(events,list)):
+        raise ValueError('Invalid browser timing or events')
     ids=[r['id'] for r in records]
     if len(ids)!=len(set(ids)) or set(ids)!={r['id'] for r in m['regions']}:
         raise ValueError('Expected exactly one decision per project region')
@@ -183,6 +204,11 @@ def apply(project,decisions_path,output_dir):
     verify(project)
     output_dir.mkdir(parents=True)
     save_labels(output_dir/'instance.tif',result,profile)
+    from .refine_conflicts import save_mask
+    save_mask(output_dir/'selected_write.tif',write,profile)
+    save_mask(output_dir/'changed_pixels.tif',result!=initial,profile)
+    with (output_dir/'regions.csv').open('w',encoding='utf-8-sig',newline='') as stream:
+        writer=csv.DictWriter(stream,fieldnames=list(logs[0]));writer.writeheader();writer.writerows(logs)
     (output_dir/'decisions.json').write_text(json.dumps(choices,indent=2),encoding='utf-8')
     manifest=dict(status='complete',project=str(project),project_sha256=digest(project/'project.json'),
                   decisions_sha256=digest(output_dir/'decisions.json'),instance_sha256=digest(output_dir/'instance.tif'),
@@ -194,6 +220,12 @@ def apply(project,decisions_path,output_dir):
                   timing=choices.get('session_wall_seconds',[]),
                   warning='Human-assisted development experiment; browser wall time includes pauses; baseline provenance unverified')
     (output_dir/'selection.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
+    text=(f"Human selection applied; GT not read.\nReviewed regions={manifest['reviewed_regions']}/{len(records)}\n"
+          f"Selected regions={manifest['selected_regions']}; selected ROI pixels={manifest['selected_roi_pixels']}\n"
+          f"Changed pixels={manifest['changed_pixels']}; self-reported actions={len(events)}\n"
+          f"Self-reported browser session seconds={sum(timing):.2f} (includes pauses; not verified active work)\n"
+          "instance.tif is a georeferenced processed crop, not a full-image export.\n")
+    (output_dir/'summary.txt').write_text(text,encoding='utf-8')
     print(f"Applied: {manifest['selected_regions']} selected regions; {manifest['changed_pixels']} changed pixels")
     return manifest
 

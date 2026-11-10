@@ -16,6 +16,8 @@ python -m experiments.manual_fusion prepare --run-dir outputs/t256_s192 --output
 
 页面会尝试在浏览器本地保存进度，但不同浏览器对本地文件存储的支持可能不同，建议经常点击“导出 decisions.json”备份。导出的JSON包含全部区域、是否查看、最终选择、选择／确认事件及浏览器会话时间。时间是自报的页面停留时间，含暂停，不等于净操作时间，也不等于系统验证的点击成本。导出多次可能产生带编号文件，请明确使用最后一次文件。
 
+页面顶部显示已查看和选择修改的区域数。选择后，下方“当前选择预览”会切换为对应候选，但尚未写入GeoTIFF。需要继续之前的操作时，使用“恢复决策JSON”导入已下载的文件；会校验项目和区域，不接受其他项目的决策。恢复将替换当前页面进度，请先导出当前进度备份。整个选择页面无需互联网。
+
 将下载的文件复制为项目中的 `outputs/manual_decisions.json`。可用文件管理器复制；默认下载位置若是 `~/Downloads/decisions.json`，也可执行：
 
 ```bash
@@ -27,6 +29,16 @@ cp "$HOME/Downloads/decisions.json" outputs/manual_decisions.json
 ```bash
 python -m experiments.manual_fusion apply --project-dir outputs/manual_fusion --decisions outputs/manual_decisions.json --output-dir outputs/manual_result
 ```
+
+导出目录包括：
+
+- `instance.tif`：与源滑窗处理范围一致、保留坐标信息的结果裁块，**不是整幅卫星影像**。
+- `selected_write.tif`：人工选择求交／求并的ROI回写范围；选择候选也可能没有实际变化。
+- `changed_pixels.tif`：相对中心优先结果实际发生变化的像素。
+- `regions.csv`：各区域原图像素位置、是否查看、最终选择和变化数量，可用于操作审计。
+- `decisions.json`、`selection.json`、`summary.txt`：固化决策、哈希与成本摘要。此时没有读取GT，也没有精度结果。
+
+可以先在QGIS加载 `instance.tif`、`selected_write.tif` 和 `changed_pixels.tif` 查看导出是否正确，再执行评分。评分后不应根据GT回改同一轮决策并将其作为首次人工结果。
 
 选择固化后单独评分：
 
