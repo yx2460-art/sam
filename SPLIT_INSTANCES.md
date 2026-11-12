@@ -46,6 +46,28 @@ python -m experiments.split_instances infer --project-dir outputs/split_project 
 
 ## 3. 预览、确认与导出
 
+### 先诊断未生成候选的正点
+
+新版本每次infer自动保存 `diagnostics.html`、`diagnostics.json`、`diagnostics.csv` 和 `diagnostics/`。在review页面点击“查看逐点SAM原始候选、分数及具体拒绝原因”，或直接用浏览器打开 `diagnostics.html`。
+
+每个正点展示SAM实际返回的所有多掩膜候选，不只展示通过者。每个候选包含：
+
+- SAM预测质量分数及当前固定阈值，分数不是与GT计算的真实IoU。
+- 原始阈值化掩膜、保护其他实例及无效影像后的掩膜、与当前正点连通的区域，三图均叠加全部正点编号。
+- 各阶段面积、被保护规则移除的像素、自己的点是否在掩膜内、还包含哪些正点、是否触及上下文边缘。
+- 低于质量阈值、自己的点缺失、包含其他正点、面积过小、非有限数值等全部适用原因。
+- 是否通过筛选、是否被选中进入重叠处理，以及该点最终是否保留。通过但分数不是最高的候选会明确标注，不能误称为模型没输出。
+
+归属其他已有实例的点显示“受保护、未调用SAM”，不伪造原始候选。NPZ保存全分辨率的三个二值阶段掩膜，PNG只做显示降采样（最长边约1000像素），不影响推理或评分。诊断会额外占用磁盘和写图时间，保存目录后可离线查看，无需重跑推理。没有保存原始浮点logits，本轮诊断不支持直接重新计算任意logit阈值。
+
+**筛选规则及默认阈值没有因增加诊断而改变**。原始掩膜可能覆盖其他已有实例，只用于观察，不允许从诊断页直接接受或导出。诊断也没有读取GT。旧输出只保留了筛选后的结果，无法恢复被丢弃的原始候选，需要使用原标点重新infer一次、新建输出目录，例如：
+
+```bash
+python -m experiments.split_instances infer --project-dir outputs/split_project --points outputs/split_project/split_points.json --checkpoint "$HOME/xy/sam/segment-anything/sam_vit_b_01ec64.pth" --output-dir outputs/split_diagnostic_v1
+```
+
+完成后查看 `outputs/split_diagnostic_v1/diagnostics.html`。不需要重新prepare，也不需要重新标点。先判断是SAM掩膜包含多个田块、质量筛选、保护范围裁剪，还是重叠处理导致失败，再设计下一项对照，不盲目降低阈值。
+
 打开 `outputs/split_proposals/review.html`，对照原边界与彩色子实例。只有合理的候选才勾选“确认接受此拆分”，默认全部不接受。导出 `split_approvals.json`，复制至 `outputs/split_approvals.json`。
 
 ```bash

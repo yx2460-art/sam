@@ -116,7 +116,7 @@ c.onclick=e=>{const box=c.getBoundingClientRect();points[id].push([Math.floor((e
     return m
 
 
-def split_candidate(rgb,parent,points,predictor,min_area=30,min_score=.8,source=None,valid=None):
+def split_candidate(rgb,parent,points,predictor,min_area=30,min_score=.8,source=None,valid=None,diagnostic_sink=None):
     """Reject ambiguous masks; never manufacture a geometric split if SAM cannot separate seeds."""
     flexible=source is not None
     if not (1 if flexible else 2)<=len(points)<=8: raise ValueError('Use 1 to 8 seeds (strict splitting requires 2)')
@@ -132,33 +132,59 @@ def split_candidate(rgb,parent,points,predictor,min_area=30,min_score=.8,source=
     if len(set(seeds))!=len(seeds): raise ValueError('Duplicate seeds')
     predictor.set_image(rgb);ys,xs=np.where(parent)
     box=np.array([xs.min(),ys.min(),xs.max(),ys.max()],dtype=np.float32)
-    logits=[];details=[];rejected=[]
+    logits=[];details=[];rejected=[];diagnostics=[]
     support=(parent|(source==0))&valid if flexible else parent
     for index,(x,y) in enumerate(seeds):
+        seed_record=dict(seed=index,point=[x,y],candidates=[],status='pending',
+                         box=None if flexible and source[y,x]==0 else box.tolist())
+        diagnostics.append(seed_record)
         if flexible and source[y,x]>0 and not parent[y,x]:
+            seed_record.update(status='protected',source_id=int(source[y,x]))
             rejected.append(dict(seed=index,source_id=int(source[y,x]),reason='Point belongs to another existing instance; protected, open that instance separately'))
             continue
         masks,quality,_=predictor.predict(point_coords=np.array([[x,y]],dtype=np.float32),
             point_labels=np.ones(1,dtype=np.int32),box=None if flexible and source[y,x]==0 else box,
             multimask_output=True,return_logits=True)
         candidates=[]
-        for raw,score in zip(masks,quality):
-            if not np.isfinite(score) or score<min_score or not np.isfinite(raw).all(): continue
-            binary=(raw>predictor.model.mask_threshold)&support
+        for candidate_index,(raw,score) in enumerate(zip(masks,quality)):
+            finite=bool(np.isfinite(raw).all());finite_score=bool(np.isfinite(score))
+            raw_mask=(raw>predictor.model.mask_threshold)&np.isfinite(raw)
+            binary=raw_mask&support
             cc,_=ndimage.label(binary,structure=np.ones((3,3)))
-            if cc[y,x]==0: continue
-            component=cc==cc[y,x]
-            if any(component[yy,xx] for j,(xx,yy) in enumerate(seeds) if j!=index): continue
-            if component.sum()<min_area: continue
-            candidates.append((float(score),raw,component))
+            contains_own=bool(cc[y,x]!=0)
+            component=cc==cc[y,x] if contains_own else np.zeros_like(parent)
+            other=[j+1 for j,(xx,yy) in enumerate(seeds) if j!=index and component[yy,xx]]
+            reasons=[]
+            if not finite_score: reasons.append('non_finite_score')
+            elif score<min_score: reasons.append('low_score')
+            if not finite: reasons.append('non_finite_mask')
+            if not contains_own: reasons.append('own_point_missing')
+            if other: reasons.append('contains_other_points')
+            if contains_own and component.sum()<min_area: reasons.append('too_small')
+            record=dict(seed=index,candidate=candidate_index,score=float(score) if finite_score else None,
+                min_score=min_score,min_area=min_area,mask_threshold=float(predictor.model.mask_threshold),
+                raw_pixels=int(raw_mask.sum()),supported_pixels=int(binary.sum()),component_pixels=int(component.sum()),
+                clipped_pixels=int((raw_mask&~support).sum()),own_point_in_raw=bool(raw_mask[y,x]),
+                own_point_in_component=contains_own,
+                raw_contains_points=[j+1 for j,(xx,yy) in enumerate(seeds) if raw_mask[yy,xx]],
+                component_contains_other_points=other,
+                touches_context_edge=bool(component[0].any() or component[-1].any() or component[:,0].any() or component[:,-1].any()),
+                rejection_codes=reasons,eligible=not reasons,selected=False)
+            seed_record['candidates'].append(record)
+            if diagnostic_sink: diagnostic_sink(record,raw_mask,binary,component)
+            if reasons: continue
+            candidates.append((float(score),raw,component,candidate_index))
         if not candidates:
-            if not flexible: return None,dict(reason='SAM cannot separate at least one seed from other child seeds',seed=index)
+            seed_record['status']='no_eligible_candidate'
+            if not flexible: return None,dict(reason='SAM cannot separate at least one seed from other child seeds',seed=index,diagnostics=diagnostics)
             rejected.append(dict(seed=index,reason='SAM cannot distinguish this point or no candidate meets quality/area thresholds'))
             continue
-        score,raw,component=max(candidates,key=lambda r:r[0])
+        score,raw,component,candidate_index=max(candidates,key=lambda r:r[0])
+        seed_record.update(status='selected_before_overlap',selected_candidate=candidate_index)
+        seed_record['candidates'][candidate_index]['selected']=True
         logits.append(np.where(component,raw,-np.inf));details.append(dict(seed=index,score=score,pixels=int(component.sum()),
-            kind='background_completion' if flexible and source[y,x]==0 else 'parent_refinement'))
-    if not logits: return None,dict(reason='No separable candidate',rejected_seeds=rejected)
+            candidate=candidate_index,kind='background_completion' if flexible and source[y,x]==0 else 'parent_refinement'))
+    if not logits: return None,dict(reason='No separable candidate',rejected_seeds=rejected,diagnostics=diagnostics)
     values=np.stack(logits);covered=np.isfinite(values).any(axis=0)
     indices=np.array([d['seed']+1 for d in details],dtype=np.uint32)
     assigned=np.where(covered,indices[np.argmax(values,axis=0)],0).astype(np.uint32)
@@ -167,14 +193,17 @@ def split_candidate(rgb,parent,points,predictor,min_area=30,min_score=.8,source=
         index=detail['seed']+1;x,y=seeds[index-1]
         cc,_=ndimage.label(assigned==index,structure=np.ones((3,3)))
         if cc[y,x]==0:
+            diagnostics[index-1]['status']='lost_seed_after_overlap'
             assigned[assigned==index]=0;rejected.append(dict(seed=index-1,reason='Seed lost during overlap resolution'));continue
         component=cc==cc[y,x];assigned[(assigned==index)&~component]=0
         if component.sum()<min_area:
+            diagnostics[index-1]['status']='too_small_after_overlap'
             assigned[assigned==index]=0;rejected.append(dict(seed=index-1,reason='Child too small after overlap resolution'));continue
+        diagnostics[index-1].update(status='retained',final_pixels=int(component.sum()))
         kept.append(detail)
-    if not kept: return None,dict(reason='No retained candidate',rejected_seeds=rejected)
-    if not flexible and len(kept)!=len(seeds): return None,dict(reason='Child lost during overlap resolution')
-    return assigned,dict(reason='proposal',children=kept,rejected_seeds=rejected,
+    if not kept: return None,dict(reason='No retained candidate',rejected_seeds=rejected,diagnostics=diagnostics)
+    if not flexible and len(kept)!=len(seeds): return None,dict(reason='Child lost during overlap resolution',diagnostics=diagnostics)
+    return assigned,dict(reason='proposal',children=kept,rejected_seeds=rejected,diagnostics=diagnostics,
         residual_pixels=int((parent&(assigned==0)).sum()),added_foreground_pixels=int(((assigned>0)&~parent).sum()))
 
 
@@ -218,7 +247,9 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
             lab=item['id'];row=regions[lab];x0,y0,x1,y1=row['xyxy'];win=Window(x0,y0,x1-x0,y1-y0)
             original=src.read(1,window=win);parent=original==lab;rgb=rgb_read(image,win,m['rgb_bands'],m['rgb_range'])
             valid=np.all(image.read_masks(m['rgb_bands'],window=win)>0,axis=0)&np.isfinite(image.read(m['rgb_bands'],window=win)).all(axis=0)
-            patch,detail=split_candidate(rgb,parent,item['points'],predictor,min_area,min_score,source=original,valid=valid)
+            from .split_diagnostics import image_sink
+            sink=image_sink(output/'diagnostics',lab,rgb)
+            patch,detail=split_candidate(rgb,parent,item['points'],predictor,min_area,min_score,source=original,valid=valid,diagnostic_sink=sink)
             entry=dict(id=lab,xyxy=row['xyxy'],points=item['points'],point_roles=item['point_roles'],
                        detail=detail,status='rejected',editable='parent_and_background')
             shutil.copyfile(project/f'{lab}_target.png',output/f'{lab}_before.png')
@@ -246,17 +277,20 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
         lab=r['id'];card=f'<h2>源实例 {lab}</h2><img src="{lab}_before.png" style="max-width:45%">'
         if r['status']=='proposal':
             card+=f'<img src="{lab}_after.png" style="max-width:45%"><p>彩色为候选新实例，原实例剩余像素保留。剩余：{r["detail"]["residual_pixels"]}，新增前景：{r["detail"].get("added_foreground_pixels",0)} 像素。</p><label><input type="checkbox" id="a{lab}">确认接受此候选（包括背景补充分割）</label>'
-        else: card+='<p>SAM未能可靠区分正点，保持原实例。请重新标点后生成新的候选。</p>'
+        else: card+='<p>本组没有保留候选，原实例保持不变。请查看逐点诊断，区分模型输出与筛选原因。</p>'
         import html
         for role in r['point_roles']:
             label={'parent':'当前实例内，参与细分','background':'原预测背景，参与补充候选','other_instance':'已有其他实例，保持保护；如需修改请打开对应ID'}[role['kind']]
             card+=f'<p>点{role["point"]}：{label}，原ID={role["source_id"]}</p>'
         for rejected in r['detail'].get('rejected_seeds',[]):
             card+=f'<p>点{rejected["seed"]+1}未生成候选：{html.escape(rejected["reason"])}</p>'
+        card+='<p><a href="diagnostics.html">查看逐点SAM原始候选、分数及具体拒绝原因</a></p>'
         cards.append(card)
     config=json.dumps(dict(hash=digest(output/'proposals.json'),ids=[r['id'] for r in proposals if r['status']=='proposal']))
     script='const c='+config+''';function download(){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify({proposals_sha256:c.hash,accepted_ids:c.ids.filter(id=>document.getElementById('a'+id).checked)},null,2)],{type:'application/json'}));a.download='split_approvals.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}'''
     (output/'review.html').write_text('<!doctype html><meta charset="utf-8"><h1>拆分候选确认</h1><p>未勾选即保留原实例。不看GT后挑选。</p><button onclick="download()">导出确认JSON</button>'+''.join(cards)+'<script>'+script+'</script>',encoding='utf-8')
+    from .split_diagnostics import write_report
+    write_report(output,proposals,min_area,min_score)
     print(f'Open {output}/review.html; {sum(r["status"]=="proposal" for r in proposals)} proposals; no GT read')
     return report
 

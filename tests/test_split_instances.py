@@ -52,6 +52,31 @@ class SplitTests(unittest.TestCase):
         for points in ([[5,3],[5,3]],[[30,3],[5,16]],[[5.5,3],[5,16]]):
             with self.assertRaises(ValueError):split_candidate(rgb,mask,points,Predictor(),3)
 
+    def test_diagnostics_report_all_rules_without_changing_candidate_selection(self):
+        class Mixed(Predictor):
+            def predict(self,point_coords,**kwargs):
+                x,y=map(int,point_coords[0]);shape=self.shape
+                whole=np.full(shape,5.);small=np.full(shape,-5.);small[y,x]=5
+                missing=np.full(shape,-5.);good=np.full(shape,-5.)
+                good[:10 if y<10 else 0]=5
+                if y>=10: good[10:]=5
+                bad=good.copy();bad[0,0]=np.nan
+                return np.array([whole,small,missing,good,bad,good]),np.array([.6,.95,.99,.92,.95,np.nan]),None
+        rgb=np.zeros((20,20,3),dtype=np.uint8);parent=np.ones((20,20),dtype=bool)
+        labels,detail=split_candidate(rgb,parent,[[4,4],[15,15]],Mixed(),min_area=3,source=parent.astype(np.uint32))
+        self.assertEqual(set(np.unique(labels)),{1,2})
+        for seed in detail['diagnostics']:
+            candidates=seed['candidates']
+            self.assertEqual(set(candidates[0]['rejection_codes']),{'low_score','contains_other_points'})
+            self.assertIn('too_small',candidates[1]['rejection_codes'])
+            self.assertIn('own_point_missing',candidates[2]['rejection_codes'])
+            self.assertTrue(candidates[3]['selected'])
+            self.assertEqual(candidates[3]['rejection_codes'],[])
+            self.assertIn('non_finite_mask',candidates[4]['rejection_codes'])
+            self.assertIn('non_finite_score',candidates[5]['rejection_codes'])
+            self.assertIsNone(candidates[5]['score'])
+            self.assertEqual(seed['status'],'retained')
+
     def test_full_instance_new_ids_approval_and_overlapping_contexts_preserve_other_objects(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder);original=self.fixture(root);snapshot=(root/'instances.tif').read_bytes()
@@ -69,6 +94,15 @@ class SplitTests(unittest.TestCase):
                 (root/'points.json').write_text(json.dumps(dict(project_sha256=digest(root/'project'/'project.json'),instances=points)))
                 proposals=infer(root/'project',root/'points.json',root/'weights.pth',root/'proposals',min_area=4,predictor=Predictor())
                 self.assertTrue(all(p['status']=='proposal' for p in proposals['proposals']))
+                self.assertTrue((root/'proposals'/'diagnostics.html').is_file())
+                self.assertTrue((root/'proposals'/'diagnostics.csv').is_file())
+                diagnostics=json.loads((root/'proposals'/'diagnostics.json').read_text(encoding='utf-8'))
+                self.assertFalse(diagnostics['ground_truth_used'])
+                record=diagnostics['instances'][0]['diagnostics'][0]['candidates'][0]
+                with np.load(root/'proposals'/record['mask_archive']) as archive:
+                    self.assertEqual(set(archive.files),{'raw','supported','component'})
+                    self.assertEqual(archive['raw'].dtype,np.bool_)
+                self.assertTrue((root/'proposals'/record['images']['raw']).is_file())
                 if shutil.which('node'):
                     check=r'''
 const fs=require('fs'),vm=require('vm'),assert=require('assert');const pages=JSON.parse(fs.readFileSync(0,'utf8'));
@@ -139,6 +173,8 @@ review.nodes.a1.checked=true;review.c.download();assert.deepEqual(review.get().a
                 self.assertEqual(p['status'],'proposal')
                 self.assertGreater(p['detail']['added_foreground_pixels'],0)
                 self.assertTrue(any(r['seed']==2 for r in p['detail']['rejected_seeds']))
+                self.assertEqual(p['detail']['diagnostics'][2]['status'],'protected')
+                self.assertEqual(p['detail']['diagnostics'][2]['candidates'],[])
                 approval=dict(proposals_sha256=digest(root/'proposals'/'proposals.json'),accepted_ids=[1])
                 (root/'approval.json').write_text(json.dumps(approval))
                 apply(root/'proposals',root/'approval.json',root/'result')
