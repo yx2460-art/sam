@@ -1,5 +1,17 @@
 # 正点交互细分与背景补充
 
+## 快速对照：只用正点，不加粘连实例大框
+
+保持原项目、7点JSON、质量阈值0.8、面积阈值30、影像上下文和其他规则不变，只增加 `--prompt-mode point-only`：
+
+```bash
+python -m experiments.split_instances infer --project-dir outputs/split_project --points outputs/split_project/split_points.json --checkpoint "$HOME/xy/sam/segment-anything/sam_vit_b_01ec64.pth" --prompt-mode point-only --output-dir outputs/split_point_only_v1
+```
+
+无需prepare或重新标点。完成后先看 `outputs/split_point_only_v1/summary.txt` 的逐点状态，再打开同目录 `review.html` 查看实际边界；必要时看 `diagnostics.html` 的原始候选。与之前大框实验对照，不覆盖之前结果。新目录已存在时换其他新名字。
+
+默认 `--prompt-mode point-box` 保持旧逻辑：当前实例正点加原实例大框，背景正点本来就不加框。`point-only` 对所有实际推理的正点都不加框，不将其他正点改作负点。记录中的box应为None。通过候选数不是正确田块数，是否真正分开仍需人工核对，不能在汇报前将未评价的结果称为精度提升。
+
 ## 已有标点如何继续
 
 更新代码后，**不需要重新生成项目或重新标7个点**。原来的project.json和点文件可继续使用。例如点文件已放在项目子目录时：

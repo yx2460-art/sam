@@ -116,9 +116,10 @@ c.onclick=e=>{const box=c.getBoundingClientRect();points[id].push([Math.floor((e
     return m
 
 
-def split_candidate(rgb,parent,points,predictor,min_area=30,min_score=.8,source=None,valid=None,diagnostic_sink=None):
+def split_candidate(rgb,parent,points,predictor,min_area=30,min_score=.8,source=None,valid=None,diagnostic_sink=None,prompt_mode='point-box'):
     """Reject ambiguous masks; never manufacture a geometric split if SAM cannot separate seeds."""
     flexible=source is not None
+    if prompt_mode not in ('point-box','point-only'): raise ValueError('Unknown prompt mode')
     if not (1 if flexible else 2)<=len(points)<=8: raise ValueError('Use 1 to 8 seeds (strict splitting requires 2)')
     if valid is None: valid=np.ones_like(parent)
     seeds=[]
@@ -135,15 +136,16 @@ def split_candidate(rgb,parent,points,predictor,min_area=30,min_score=.8,source=
     logits=[];details=[];rejected=[];diagnostics=[]
     support=(parent|(source==0))&valid if flexible else parent
     for index,(x,y) in enumerate(seeds):
+        prompt_box=None if prompt_mode=='point-only' or (flexible and source[y,x]==0) else box
         seed_record=dict(seed=index,point=[x,y],candidates=[],status='pending',
-                         box=None if flexible and source[y,x]==0 else box.tolist())
+                         prompt_mode=prompt_mode,box=None if prompt_box is None else prompt_box.tolist())
         diagnostics.append(seed_record)
         if flexible and source[y,x]>0 and not parent[y,x]:
             seed_record.update(status='protected',source_id=int(source[y,x]))
             rejected.append(dict(seed=index,source_id=int(source[y,x]),reason='Point belongs to another existing instance; protected, open that instance separately'))
             continue
         masks,quality,_=predictor.predict(point_coords=np.array([[x,y]],dtype=np.float32),
-            point_labels=np.ones(1,dtype=np.int32),box=None if flexible and source[y,x]==0 else box,
+            point_labels=np.ones(1,dtype=np.int32),box=prompt_box,
             multimask_output=True,return_logits=True)
         candidates=[]
         for candidate_index,(raw,score) in enumerate(zip(masks,quality)):
@@ -207,10 +209,11 @@ def split_candidate(rgb,parent,points,predictor,min_area=30,min_score=.8,source=
         residual_pixels=int((parent&(assigned==0)).sum()),added_foreground_pixels=int(((assigned>0)&~parent).sum()))
 
 
-def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_score=.8,predictor=None):
+def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_score=.8,predictor=None,prompt_mode='point-box'):
     project,output=Path(project).resolve(),Path(output).resolve();m=sealed(project/'project.json')
     if output.exists(): raise FileExistsError('Use a new output directory')
     if min_area<1 or not 0<=min_score<=1: raise ValueError('Invalid proposal thresholds')
+    if prompt_mode not in ('point-box','point-only'): raise ValueError('Unknown prompt mode')
     hashes={str(p):digest(p) for p in (project/'project.json',Path(points_path).resolve(),Path(checkpoint).resolve())}
     selection=read(points_path)
     if selection['project_sha256']!=digest(project/'project.json'): raise ValueError('Points belong to another project')
@@ -249,7 +252,7 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
             valid=np.all(image.read_masks(m['rgb_bands'],window=win)>0,axis=0)&np.isfinite(image.read(m['rgb_bands'],window=win)).all(axis=0)
             from .split_diagnostics import image_sink
             sink=image_sink(output/'diagnostics',lab,rgb)
-            patch,detail=split_candidate(rgb,parent,item['points'],predictor,min_area,min_score,source=original,valid=valid,diagnostic_sink=sink)
+            patch,detail=split_candidate(rgb,parent,item['points'],predictor,min_area,min_score,source=original,valid=valid,diagnostic_sink=sink,prompt_mode=prompt_mode)
             entry=dict(id=lab,xyxy=row['xyxy'],points=item['points'],point_roles=item['point_roles'],
                        detail=detail,status='rejected',editable='parent_and_background')
             shutil.copyfile(project/f'{lab}_target.png',output/f'{lab}_before.png')
@@ -270,7 +273,7 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
     if any(digest(p)!=value for p,value in hashes.items()): raise ValueError('Inputs changed during inference')
     report=dict(status='ready_for_review',operation='parent_refinement_and_background_completion',
         project=str(project),project_sha256=digest(project/'project.json'),
-        proposals=proposals,min_area=min_area,min_score=min_score,input_sha256=hashes,ground_truth_used=False)
+        proposals=proposals,min_area=min_area,min_score=min_score,prompt_mode=prompt_mode,input_sha256=hashes,ground_truth_used=False)
     (output/'proposals.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
     cards=[]
     for r in proposals:
@@ -288,9 +291,17 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
         cards.append(card)
     config=json.dumps(dict(hash=digest(output/'proposals.json'),ids=[r['id'] for r in proposals if r['status']=='proposal']))
     script='const c='+config+''';function download(){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify({proposals_sha256:c.hash,accepted_ids:c.ids.filter(id=>document.getElementById('a'+id).checked)},null,2)],{type:'application/json'}));a.download='split_approvals.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}'''
-    (output/'review.html').write_text('<!doctype html><meta charset="utf-8"><h1>拆分候选确认</h1><p>未勾选即保留原实例。不看GT后挑选。</p><button onclick="download()">导出确认JSON</button>'+''.join(cards)+'<script>'+script+'</script>',encoding='utf-8')
+    (output/'review.html').write_text('<!doctype html><meta charset="utf-8"><h1>拆分候选确认</h1><p>提示模式：'+prompt_mode+'。未勾选即保留原实例。不看GT后挑选。</p><button onclick="download()">导出确认JSON</button>'+''.join(cards)+'<script>'+script+'</script>',encoding='utf-8')
     from .split_diagnostics import write_report
     write_report(output,proposals,min_area,min_score)
+    lines=[f'Prompt mode: {prompt_mode}; min_score={min_score}; min_area={min_area}; no GT read.',
+           'Retained candidates are proposals, not confirmed correct parcels.']
+    for p in proposals:
+        lines.append(f"Instance {p['id']}: {p['status']}")
+        for seed in p['detail'].get('diagnostics',[]):
+            scores_text=','.join('NA' if c['score'] is None else f"{c['score']:.4f}" for c in seed['candidates'])
+            lines.append(f"  Point {seed['seed']+1}: {seed['status']}; scores=[{scores_text}]; box={seed['box']}")
+    (output/'summary.txt').write_text('\n'.join(lines)+'\n',encoding='utf-8');print('\n'.join(lines),flush=True)
     print(f'Open {output}/review.html; {sum(r["status"]=="proposal" for r in proposals)} proposals; no GT read')
     return report
 
@@ -394,6 +405,7 @@ def main():
     p=sub.add_parser('infer');p.add_argument('--project-dir',type=Path,required=True);p.add_argument('--points',type=Path,required=True)
     p.add_argument('--checkpoint',type=Path,required=True);p.add_argument('--output-dir',type=Path,required=True)
     p.add_argument('--device',default='cuda:0');p.add_argument('--min-area',type=int,default=30);p.add_argument('--min-score',type=float,default=.8)
+    p.add_argument('--prompt-mode',choices=['point-box','point-only'],default='point-box',help='point-only removes the merged-instance box; all other rules unchanged')
     p=sub.add_parser('apply');p.add_argument('--proposals-dir',type=Path,required=True);p.add_argument('--approvals',type=Path,required=True);p.add_argument('--output-dir',type=Path,required=True)
     p=sub.add_parser('evaluate');p.add_argument('--result-dir',type=Path,required=True);p.add_argument('--gt',type=Path,required=True)
     p.add_argument('--eval-mask',type=Path,required=True);p.add_argument('--output-dir',type=Path,required=True)
@@ -411,7 +423,7 @@ def main():
             a.rgb_range=a.rgb_range or p.get('rgb_range');a.allow_crs_mismatch |= p.get('allow_crs_mismatch',False)
         if not a.image or not a.instances: raise ValueError('Provide --run-dir or both --image and --instances')
         prepare(a.image,a.instances,a.output_dir,a.instance_ids,a.eval_mask,a.context,a.max_side,a.rgb_bands or [1,2,3],a.rgb_range,a.allow_crs_mismatch)
-    elif a.command=='infer':infer(a.project_dir,a.points,a.checkpoint,a.output_dir,a.device,a.min_area,a.min_score)
+    elif a.command=='infer':infer(a.project_dir,a.points,a.checkpoint,a.output_dir,a.device,a.min_area,a.min_score,prompt_mode=a.prompt_mode)
     elif a.command=='apply':apply(a.proposals_dir,a.approvals,a.output_dir)
     else:evaluate(a.result_dir,a.gt,a.eval_mask,a.output_dir,a.allow_crs_mismatch,a.boundary_tolerance)
 

@@ -32,6 +32,23 @@ class Predictor:
 
 
 class SplitTests(unittest.TestCase):
+    def test_point_only_removes_box_and_preserves_positive_labels_and_thresholds(self):
+        class Spy(Predictor):
+            def __init__(self): super().__init__();self.boxes=[]
+            def predict(self,point_coords,point_labels,box,**kwargs):
+                self.boxes.append(box)
+                return super().predict(point_coords,point_labels,box,**kwargs)
+        parent=np.ones((20,20),dtype=bool);rgb=np.zeros((20,20,3),dtype=np.uint8)
+        for mode in ('point-box','point-only'):
+            predictor=Spy()
+            result,details=split_candidate(rgb,parent,[[5,3],[5,16]],predictor,min_area=3,
+                                           source=parent.astype(np.uint32),prompt_mode=mode)
+            self.assertIsNotNone(result)
+            self.assertEqual(len(predictor.boxes),2)
+            self.assertTrue(all((b is None)==(mode=='point-only') for b in predictor.boxes))
+            self.assertTrue(all(d['prompt_mode']==mode for d in details['diagnostics']))
+            self.assertEqual(details['diagnostics'][0]['candidates'][0]['min_score'],.8)
+
     def fixture(self,root):
         labels=np.zeros((24,24),dtype=np.uint32);labels[3:21,3:12]=1;labels[3:21,12:21]=2
         truth=labels.copy();truth[3:12,3:12]=10;truth[12:21,3:12]=11
