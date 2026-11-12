@@ -21,6 +21,7 @@ class Predictor:
     def set_image(self,rgb): self.shape=rgb.shape[:2]
     def predict(self,point_coords,point_labels,box,**kwargs):
         assert list(point_labels)==[1]
+        if box is None: box=[0,0,self.shape[1]-1,self.shape[0]-1]
         raw=np.full(self.shape,-5,dtype=float)
         yy,xx=np.indices(self.shape);middle=(box[1]+box[3])/2
         mask=(xx>=box[0])&(xx<=box[2])&(yy>=box[1])&(yy<=box[3])
@@ -78,7 +79,10 @@ Blob:class{constructor(parts){payload=JSON.parse(parts.join(''));}},URL:{createO
 document:{getElementById:id=>nodes[id]||(nodes[id]={checked:false}),createElement:()=>({click(){}})}};
 vm.createContext(c);vm.runInContext(page.match(/<script>([\s\S]*?)<\/script>/)[1],c);return {c,nodes,get:()=>payload};}
 const points=harness(pages[0]);points.nodes.c1.onclick({clientX:55,clientY:55});points.nodes.c1.onclick({clientX:55,clientY:165});points.c.download();
-assert.deepEqual(points.get().instances,[{id:1,points:[[5,5],[5,16]]}]);points.c.undo(1);assert(points.nodes.s1.textContent.startsWith('1 '));
+assert.deepEqual(points.get().instances,[{id:1,points:[[5,5],[5,16]]}]);
+points.nodes.c1.onclick({clientX:15,clientY:15});assert(points.nodes.s1.textContent.includes('预测背景'));points.c.undo(1);
+points.nodes.c1.onclick({clientX:115,clientY:55});assert(points.nodes.s1.textContent.includes('已有实例ID 2'));points.c.undo(1);
+points.c.undo(1);assert(points.nodes.s1.textContent.startsWith('1 '));
 const review=harness(pages[1]);review.c.download();assert.deepEqual(review.get().accepted_ids,[]);
 review.nodes.a1.checked=true;review.c.download();assert.deepEqual(review.get().accepted_ids,[1]);
 '''
@@ -114,6 +118,61 @@ review.nodes.a1.checked=true;review.c.download();assert.deepEqual(review.get().a
             root=Path(folder);self.fixture(root)
             with self.assertRaises(ValueError):prepare(root/'image.tif',root/'instances.tif',root/'project',ids=[1],pad=2,max_side=5)
             self.assertFalse((root/'project').exists())
+
+    def test_background_positive_adds_foreground_other_instance_point_is_reported_not_fatal(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);original=self.fixture(root)
+            # Use the old project format/hash flow: existing exported points must remain usable.
+            m=prepare(root/'image.tif',root/'instances.tif',root/'project',ids=[1],pad=4)
+            x0,y0,_,_=m['regions'][0]['xyxy']
+            points=[[1-x0,1-y0],[6-x0,17-y0],[14-x0,17-y0]]
+            annotation=dict(project_sha256=digest(root/'project'/'project.json'),instances=[dict(id=1,points=points)])
+            (root/'points.json').write_text(json.dumps(annotation))
+            actual=rasterio.open
+            def no_gt(path,*a,**kw):
+                self.assertNotEqual(Path(path).resolve(),(root/'gt.tif').resolve())
+                return actual(path,*a,**kw)
+            with patch('rasterio.open',side_effect=no_gt):
+                proposals=infer(root/'project',root/'points.json',root/'weights.pth',root/'proposals',min_area=4,predictor=Predictor())
+                p=proposals['proposals'][0]
+                self.assertEqual([r['kind'] for r in p['point_roles']],['background','parent','other_instance'])
+                self.assertEqual(p['status'],'proposal')
+                self.assertGreater(p['detail']['added_foreground_pixels'],0)
+                self.assertTrue(any(r['seed']==2 for r in p['detail']['rejected_seeds']))
+                approval=dict(proposals_sha256=digest(root/'proposals'/'proposals.json'),accepted_ids=[1])
+                (root/'approval.json').write_text(json.dumps(approval))
+                apply(root/'proposals',root/'approval.json',root/'result')
+            with actual(root/'result'/'instance.tif') as src:edited=src.read(1)
+            self.assertGreater(int((edited>0).sum()),int((original>0).sum()))
+            np.testing.assert_equal(edited[original==2],original[original==2])
+            self.assertTrue(np.all(edited[original>0]>0))
+            self.assertNotIn('点击其他实例无效',(root/'project'/'index.html').read_text(encoding='utf-8'))
+
+    def test_one_background_point_allowed_and_no_candidate_is_not_a_validation_error(self):
+        original=np.zeros((20,20),dtype=np.uint32);original[10:18,2:8]=1
+        parent=original==1;rgb=np.zeros((20,20,3),dtype=np.uint8)
+        assigned,details=split_candidate(rgb,parent,[[3,3]],Predictor(),3,source=original)
+        self.assertIsNotNone(assigned)
+        self.assertEqual(details['children'][0]['kind'],'background_completion')
+        original[1,1]=2
+        assigned,details=split_candidate(rgb,parent,[[1,1]],Predictor(),3,source=original)
+        self.assertIsNone(assigned)
+        self.assertEqual(details['rejected_seeds'][0]['source_id'],2)
+
+    def test_overlapping_background_additions_are_rejected_before_export(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);self.fixture(root)
+            m=prepare(root/'image.tif',root/'instances.tif',root/'project',ids=[1,2],pad=24)
+            points=dict(project_sha256=digest(root/'project'/'project.json'),instances=[
+                dict(id=r['id'],points=[[1,1]]) for r in m['regions']])
+            (root/'points.json').write_text(json.dumps(points))
+            proposals=infer(root/'project',root/'points.json',root/'weights.pth',root/'proposals',min_area=4,predictor=Predictor())
+            self.assertTrue(all(p['status']=='proposal' for p in proposals['proposals']))
+            approval=dict(proposals_sha256=digest(root/'proposals'/'proposals.json'),accepted_ids=[1,2])
+            (root/'approval.json').write_text(json.dumps(approval))
+            with self.assertRaisesRegex(ValueError,'overlap'):
+                apply(root/'proposals',root/'approval.json',root/'result')
+            self.assertFalse((root/'result').exists())
 
 
 if __name__=='__main__':unittest.main()

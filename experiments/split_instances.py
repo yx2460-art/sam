@@ -1,4 +1,4 @@
-"""Positive-point SAM proposals for complete source instances, with explicit human approval."""
+"""Human-positive SAM instance refinement and background completion, with explicit approval."""
 import argparse
 import json
 import shutil
@@ -71,17 +71,21 @@ def prepare(image_path,instances,output,ids=None,roi_path=None,pad=128,max_side=
                 raise ValueError(f'Instance {lab}: full context exceeds {max_side}; no silent truncation. Select fewer IDs or explicitly increase --max-side')
             plans.append(dict(id=lab,xyxy=[x0,y0,x1,y1]))
         output.mkdir(parents=True)
-        cards=[]
+        cards=[];ownership={}
         for row in plans:
             lab=row['id'];x0,y0,x1,y1=row['xyxy'];win=Window(x0,y0,x1-x0,y1-y0)
-            target=src.read(1,window=win)==lab;rgb=rgb_read(image,win,bands,value_range)
+            original=src.read(1,window=win);target=original==lab;rgb=rgb_read(image,win,bands,value_range)
+            ownership[lab]=[]
+            for line in original:
+                starts=np.r_[0,np.flatnonzero(line[1:]!=line[:-1])+1]
+                ownership[lab].append([[int(x),int(line[x])] for x in starts])
             if np.any(target&~np.all(image.read_masks(bands,window=win)>0,axis=0)):
                 raise ValueError(f'Instance {lab} includes invalid image pixels')
             save_png(output/f'{lab}_rgb.png',rgb)
             save_png(output/f'{lab}_target.png',overlay(rgb,target.astype(np.uint32),np.ones_like(target)))
             row['source_pixels']=int(target.sum())
             cards.append(f'<section><h2>实例 {lab} · 原图左上角 ({x0},{y0})</h2>'
-                         f'<p>黄色为待拆实例边界。每个实际田块内部点一次，至少2点。点击其他实例无效，推理时会校验。</p>'
+                         f'<p>黄色为原预测实例边界，不是标点限制。每个不同田块点一次，1至8点。背景点可补充漏检；已有其他ID会提示并保护。</p>'
                          f'<canvas id="c{lab}" width="{x1-x0}" height="{y1-y0}"></canvas>'
                          f'<p><button onclick="undo({lab})">撤销最后一点</button><button onclick="clearPoints({lab})">清空</button>'
                          f'<span id="s{lab}"></span></p></section>')
@@ -89,17 +93,20 @@ def prepare(image_path,instances,output,ids=None,roi_path=None,pad=128,max_side=
     m=dict(status='ready',image=str(image_path),instances=str(instances),regions=plans,max_source_id=max_id,
            rgb_bands=list(bands),rgb_range=value_range,allow_crs_mismatch=allow,
            input_sha256={str(p):digest(p) for p in inputs},
-           protocol='One positive seed per child; full source instance context; no GT; residual retains parent ID')
+           protocol='One positive per parcel; parent/background candidates; other existing IDs protected; no GT; residual preserved')
     (output/'project.json').write_text(json.dumps(m,indent=2),encoding='utf-8')
-    config=json.dumps(dict(hash=digest(output/'project.json'),regions=plans))
+    config=json.dumps(dict(hash=digest(output/'project.json'),regions=plans,ownership=ownership))
     script=r'''
 const config=CONFIG,points=Object.fromEntries(config.regions.map(r=>[r.id,[]])),images={},events=[],started=Date.now();
 function draw(id){const c=document.getElementById('c'+id),ctx=c.getContext('2d');ctx.drawImage(images[id],0,0);
 points[id].forEach((p,i)=>{ctx.beginPath();ctx.arc(p[0],p[1],6,0,Math.PI*2);ctx.fillStyle='#ff3030';ctx.fill();ctx.fillStyle='white';ctx.font='18px sans-serif';ctx.fillText(i+1,p[0]+8,p[1]);});
-document.getElementById('s'+id).textContent=points[id].length+' 个子田块正点';}
+document.getElementById('s'+id).textContent=points[id].length+' 个田块正点。'+points[id].map((p,i)=>{
+const rows=config.ownership[id],line=rows[p[1]];if(!line||p[0]<0||p[0]>=c.width)return '点'+(i+1)+'超出影像';
+let label=line[0][1];for(const run of line){if(run[0]>p[0])break;label=run[1];}
+return '点'+(i+1)+'：'+(label===id?'原实例内':label===0?'预测背景，可补充候选':'已有实例ID '+label+'，保持保护，请单独打开该ID');}).join('；');}
 function undo(id){points[id].pop();events.push({id,action:'undo',utc:new Date().toISOString()});draw(id);}function clearPoints(id){points[id]=[];events.push({id,action:'clear',utc:new Date().toISOString()});draw(id);}
 function download(){const rows=config.regions.filter(r=>points[r.id].length).map(r=>({id:r.id,points:points[r.id]}));
-if(rows.some(r=>r.points.length<2||r.points.length>8)){alert('每个选中实例需要2至8个不同子田块正点');return;}
+if(rows.some(r=>r.points.length<1||r.points.length>8)){alert('每个区域需要1至8个不同田块正点');return;}
 if(!rows.length){alert('请先标点');return;}const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify({project_sha256:config.hash,instances:rows,events,browser_wall_seconds:(Date.now()-started)/1000},null,2)],{type:'application/json'}));a.download='split_points.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}
 config.regions.forEach(r=>{const id=r.id,c=document.getElementById('c'+id),im=new Image();images[id]=im;im.onload=()=>draw(id);im.src=id+'_target.png';
 c.onclick=e=>{const box=c.getBoundingClientRect();points[id].push([Math.floor((e.clientX-box.left)*c.width/box.width),Math.floor((e.clientY-box.top)*c.height/box.height)]);events.push({id,action:'point',utc:new Date().toISOString()});draw(id);};});
@@ -109,44 +116,66 @@ c.onclick=e=>{const box=c.getBoundingClientRect();points[id].push([Math.floor((e
     return m
 
 
-def split_candidate(rgb,parent,points,predictor,min_area=30,min_score=.8):
+def split_candidate(rgb,parent,points,predictor,min_area=30,min_score=.8,source=None,valid=None):
     """Reject ambiguous masks; never manufacture a geometric split if SAM cannot separate seeds."""
-    if not 2<=len(points)<=8: raise ValueError('Use 2 to 8 seeds')
+    flexible=source is not None
+    if not (1 if flexible else 2)<=len(points)<=8: raise ValueError('Use 1 to 8 seeds (strict splitting requires 2)')
+    if valid is None: valid=np.ones_like(parent)
     seeds=[]
     for p in points:
         if len(p)!=2 or any(type(v) is not int for v in p): raise ValueError('Integer pixel points required')
         x,y=p
-        if not (0<=y<parent.shape[0] and 0<=x<parent.shape[1] and parent[y,x]):
-            raise ValueError('Positive point outside selected instance')
+        if not (0<=y<parent.shape[0] and 0<=x<parent.shape[1] and valid[y,x]):
+            raise ValueError('Positive point outside valid image context')
+        if not flexible and not parent[y,x]: raise ValueError('Positive point outside selected instance')
         seeds.append((x,y))
     if len(set(seeds))!=len(seeds): raise ValueError('Duplicate seeds')
     predictor.set_image(rgb);ys,xs=np.where(parent)
     box=np.array([xs.min(),ys.min(),xs.max(),ys.max()],dtype=np.float32)
-    logits=[];details=[]
+    logits=[];details=[];rejected=[]
+    support=(parent|(source==0))&valid if flexible else parent
     for index,(x,y) in enumerate(seeds):
+        if flexible and source[y,x]>0 and not parent[y,x]:
+            rejected.append(dict(seed=index,source_id=int(source[y,x]),reason='Point belongs to another existing instance; protected, open that instance separately'))
+            continue
         masks,quality,_=predictor.predict(point_coords=np.array([[x,y]],dtype=np.float32),
-            point_labels=np.ones(1,dtype=np.int32),box=box,multimask_output=True,return_logits=True)
+            point_labels=np.ones(1,dtype=np.int32),box=None if flexible and source[y,x]==0 else box,
+            multimask_output=True,return_logits=True)
         candidates=[]
         for raw,score in zip(masks,quality):
             if not np.isfinite(score) or score<min_score or not np.isfinite(raw).all(): continue
-            binary=(raw>predictor.model.mask_threshold)&parent
+            binary=(raw>predictor.model.mask_threshold)&support
             cc,_=ndimage.label(binary,structure=np.ones((3,3)))
             if cc[y,x]==0: continue
             component=cc==cc[y,x]
             if any(component[yy,xx] for j,(xx,yy) in enumerate(seeds) if j!=index): continue
             if component.sum()<min_area: continue
             candidates.append((float(score),raw,component))
-        if not candidates: return None,dict(reason='SAM cannot separate at least one seed from other child seeds',seed=index)
+        if not candidates:
+            if not flexible: return None,dict(reason='SAM cannot separate at least one seed from other child seeds',seed=index)
+            rejected.append(dict(seed=index,reason='SAM cannot distinguish this point or no candidate meets quality/area thresholds'))
+            continue
         score,raw,component=max(candidates,key=lambda r:r[0])
-        logits.append(np.where(component,raw,-np.inf));details.append(dict(seed=index,score=score,pixels=int(component.sum())))
+        logits.append(np.where(component,raw,-np.inf));details.append(dict(seed=index,score=score,pixels=int(component.sum()),
+            kind='background_completion' if flexible and source[y,x]==0 else 'parent_refinement'))
+    if not logits: return None,dict(reason='No separable candidate',rejected_seeds=rejected)
     values=np.stack(logits);covered=np.isfinite(values).any(axis=0)
-    assigned=np.where(covered,np.argmax(values,axis=0)+1,0).astype(np.uint32)
-    for index,(x,y) in enumerate(seeds,1):
+    indices=np.array([d['seed']+1 for d in details],dtype=np.uint32)
+    assigned=np.where(covered,indices[np.argmax(values,axis=0)],0).astype(np.uint32)
+    kept=[]
+    for detail in details:
+        index=detail['seed']+1;x,y=seeds[index-1]
         cc,_=ndimage.label(assigned==index,structure=np.ones((3,3)))
-        if cc[y,x]==0: return None,dict(reason='Seed lost during overlap resolution')
+        if cc[y,x]==0:
+            assigned[assigned==index]=0;rejected.append(dict(seed=index-1,reason='Seed lost during overlap resolution'));continue
         component=cc==cc[y,x];assigned[(assigned==index)&~component]=0
-        if component.sum()<min_area: return None,dict(reason='Child too small after overlap resolution')
-    return assigned,dict(reason='proposal',children=details,residual_pixels=int((parent&(assigned==0)).sum()))
+        if component.sum()<min_area:
+            assigned[assigned==index]=0;rejected.append(dict(seed=index-1,reason='Child too small after overlap resolution'));continue
+        kept.append(detail)
+    if not kept: return None,dict(reason='No retained candidate',rejected_seeds=rejected)
+    if not flexible and len(kept)!=len(seeds): return None,dict(reason='Child lost during overlap resolution')
+    return assigned,dict(reason='proposal',children=kept,rejected_seeds=rejected,
+        residual_pixels=int((parent&(assigned==0)).sum()),added_foreground_pixels=int(((assigned>0)&~parent).sum()))
 
 
 def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_score=.8,predictor=None):
@@ -159,17 +188,24 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
     regions={r['id']:r for r in m['regions']};items=selection['instances'];seen=set()
     if not items: raise ValueError('No selected instances')
     # Validate all annotations before loading SAM.
-    with rasterio.open(m['instances']) as src:
+    with rasterio.open(m['instances']) as src,rasterio.open(m['image']) as image:
         for item in items:
             lab=item['id']
             if lab in seen or lab not in regions: raise ValueError('Unknown or duplicate instance')
             seen.add(lab);x0,y0,x1,y1=regions[lab]['xyxy'];parent=src.read(1,window=Window(x0,y0,x1-x0,y1-y0))==lab
-            pts=item['points']
-            if not 2<=len(pts)<=8 or len({tuple(p) for p in pts})!=len(pts): raise ValueError('Need 2 to 8 distinct points')
-            for p in pts:
+            pts=item['points'];win=Window(x0,y0,x1-x0,y1-y0)
+            original=src.read(1,window=win);valid=np.all(image.read_masks(m['rgb_bands'],window=win)>0,axis=0)
+            valid &= np.isfinite(image.read(m['rgb_bands'],window=win)).all(axis=0)
+            if not 1<=len(pts)<=8 or len({tuple(p) for p in pts})!=len(pts): raise ValueError('Need 1 to 8 distinct points')
+            item['point_roles']=[]
+            for number,p in enumerate(pts,1):
                 if len(p)!=2 or any(type(v) is not int for v in p): raise ValueError('Integer pixel points required')
                 x,y=p
-                if not (0<=y<parent.shape[0] and 0<=x<parent.shape[1] and parent[y,x]): raise ValueError('Point outside source instance')
+                if not (0<=y<parent.shape[0] and 0<=x<parent.shape[1] and valid[y,x]):
+                    raise ValueError(f'Instance {lab}, point {number}: outside valid image context; coordinate ({x},{y})')
+                actual=int(original[y,x]);kind='parent' if actual==lab else 'background' if actual==0 else 'other_instance'
+                item['point_roles'].append(dict(point=number,source_id=actual,kind=kind))
+                print(f'Instance {lab}, point {number}: {kind}, existing ID={actual}',flush=True)
     if m['max_source_id']+sum(len(r['points']) for r in items)>np.iinfo(np.uint32).max: raise ValueError('ID overflow')
     if predictor is None:
         sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'segment-anything'))
@@ -181,32 +217,42 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
         for item in items:
             lab=item['id'];row=regions[lab];x0,y0,x1,y1=row['xyxy'];win=Window(x0,y0,x1-x0,y1-y0)
             original=src.read(1,window=win);parent=original==lab;rgb=rgb_read(image,win,m['rgb_bands'],m['rgb_range'])
-            patch,detail=split_candidate(rgb,parent,item['points'],predictor,min_area,min_score)
-            entry=dict(id=lab,xyxy=row['xyxy'],points=item['points'],detail=detail,status='rejected')
+            valid=np.all(image.read_masks(m['rgb_bands'],window=win)>0,axis=0)&np.isfinite(image.read(m['rgb_bands'],window=win)).all(axis=0)
+            patch,detail=split_candidate(rgb,parent,item['points'],predictor,min_area,min_score,source=original,valid=valid)
+            entry=dict(id=lab,xyxy=row['xyxy'],points=item['points'],point_roles=item['point_roles'],
+                       detail=detail,status='rejected',editable='parent_and_background')
             shutil.copyfile(project/f'{lab}_target.png',output/f'{lab}_before.png')
             if patch is not None:
-                ids=list(range(next_id,next_id+len(item['points'])));next_id+=len(ids)
+                ids=list(range(next_id,next_id+len(detail['children'])));next_id+=len(ids)
                 updated=original.astype(np.uint32).copy()
-                for local,global_id in enumerate(ids,1): updated[patch==local]=global_id
+                for child,global_id in zip(detail['children'],ids):
+                    child['new_id']=global_id;updated[patch==child['seed']+1]=global_id
                 path=output/f'{lab}_proposal.tif';save_labels(path,updated,dict(src.profile,width=x1-x0,height=y1-y0,transform=src.window_transform(win)))
-                display=rgb.copy();display[~parent]=(display[~parent]*.3).astype(np.uint8)
+                display=rgb.copy();protected=(original!=0)&~parent;display[protected]=(display[protected]*.3).astype(np.uint8)
                 colors=[[255,80,80],[50,200,255],[100,255,100],[255,180,30],[220,100,255],[255,100,180],[120,200,130],[100,130,255]]
-                for i,color in enumerate(colors[:len(ids)],1):
-                    mask=patch==i;display[mask]=(.5*display[mask]+.5*np.array(color)).astype(np.uint8)
+                for child,color in zip(detail['children'],colors):
+                    mask=patch==child['seed']+1;display[mask]=(.5*display[mask]+.5*np.array(color)).astype(np.uint8)
                 save_png(output/f'{lab}_after.png',display)
                 entry.update(status='proposal',child_ids=ids,path=str(path),sha256=digest(path))
             proposals.append(entry)
     sealed(project/'project.json')
     if any(digest(p)!=value for p,value in hashes.items()): raise ValueError('Inputs changed during inference')
-    report=dict(status='ready_for_review',project=str(project),project_sha256=digest(project/'project.json'),
+    report=dict(status='ready_for_review',operation='parent_refinement_and_background_completion',
+        project=str(project),project_sha256=digest(project/'project.json'),
         proposals=proposals,min_area=min_area,min_score=min_score,input_sha256=hashes,ground_truth_used=False)
     (output/'proposals.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
     cards=[]
     for r in proposals:
         lab=r['id'];card=f'<h2>源实例 {lab}</h2><img src="{lab}_before.png" style="max-width:45%">'
         if r['status']=='proposal':
-            card+=f'<img src="{lab}_after.png" style="max-width:45%"><p>彩色为新子实例，未分配部分保留原ID。剩余像素：{r["detail"]["residual_pixels"]}</p><label><input type="checkbox" id="a{lab}">确认接受此拆分</label>'
+            card+=f'<img src="{lab}_after.png" style="max-width:45%"><p>彩色为候选新实例，原实例剩余像素保留。剩余：{r["detail"]["residual_pixels"]}，新增前景：{r["detail"].get("added_foreground_pixels",0)} 像素。</p><label><input type="checkbox" id="a{lab}">确认接受此候选（包括背景补充分割）</label>'
         else: card+='<p>SAM未能可靠区分正点，保持原实例。请重新标点后生成新的候选。</p>'
+        import html
+        for role in r['point_roles']:
+            label={'parent':'当前实例内，参与细分','background':'原预测背景，参与补充候选','other_instance':'已有其他实例，保持保护；如需修改请打开对应ID'}[role['kind']]
+            card+=f'<p>点{role["point"]}：{label}，原ID={role["source_id"]}</p>'
+        for rejected in r['detail'].get('rejected_seeds',[]):
+            card+=f'<p>点{rejected["seed"]+1}未生成候选：{html.escape(rejected["reason"])}</p>'
         cards.append(card)
     config=json.dumps(dict(hash=digest(output/'proposals.json'),ids=[r['id'] for r in proposals if r['status']=='proposal']))
     script='const c='+config+''';function download(){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify({proposals_sha256:c.hash,accepted_ids:c.ids.filter(id=>document.getElementById('a'+id).checked)},null,2)],{type:'application/json'}));a.download='split_approvals.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}'''
@@ -225,31 +271,44 @@ def apply(proposals_dir,approvals_path,output):
     if len(set(accepted))!=len(accepted) or not set(accepted)<=set(available): raise ValueError('Invalid approved IDs')
     for p in r['proposals']:
         if p['status']=='proposal' and digest(p['path'])!=p['sha256']: raise ValueError('Proposal changed')
+    # Preflight all accepted edits, including background additions and cross-context conflicts.
+    edits=[]
+    with rasterio.open(m['instances']) as src:
+        for lab in accepted:
+            p=available[lab];x0,y0,x1,y1=p['xyxy'];win=Window(x0,y0,x1-x0,y1-y0)
+            original=src.read(1,window=win)
+            with rasterio.open(p['path']) as patch:
+                if patch.shape!=original.shape or not patch.transform.almost_equals(src.window_transform(win)):
+                    raise ValueError('Proposal grid changed')
+                candidate=patch.read(1)
+            protected=(original!=lab)&(original!=0) if p.get('editable')=='parent_and_background' else original!=lab
+            if np.any(candidate[protected]!=original[protected]): raise ValueError('Proposal overwrites another existing instance')
+            change=candidate!=original
+            if np.any(change&~np.isin(candidate,p['child_ids'])): raise ValueError('Unexpected deletion or unallocated new ID')
+            for old,old_mask,_ in edits:
+                a,b,c,d=old['xyxy'];left,top,right,bottom=max(a,x0),max(b,y0),min(c,x1),min(d,y1)
+                if left<right and top<bottom and np.any(old_mask[top-b:bottom-b,left-a:right-a]&change[top-y0:bottom-y0,left-x0:right-x0]):
+                    raise ValueError('Approved proposals overlap in their write pixels; approve one, then prepare a new round from its exported result')
+            edits.append((p,change,candidate))
     output.mkdir(parents=True);mapping=[]
     with rasterio.open(m['instances']) as src:
         profile=src.profile.copy();profile.update(dtype='uint32',nodata=None,compress='deflate')
         with rasterio.open(output/'instance.tif','w',**profile) as dst:
             for _,win in src.block_windows(1): dst.write(src.read(1,window=win).astype(np.uint32),1,window=win)
-            for lab in accepted:
-                p=available[lab];x0,y0,x1,y1=p['xyxy'];win=Window(x0,y0,x1-x0,y1-y0)
-                original=src.read(1,window=win)
-                with rasterio.open(p['path']) as patch:
-                    if patch.shape!=original.shape or not patch.transform.almost_equals(src.window_transform(win)): raise ValueError('Proposal grid changed')
-                    candidate=patch.read(1)
-                if np.any(candidate[original!=lab]!=original[original!=lab]): raise ValueError('Proposal overwrites other instances')
-                # Read the current output: overlapping contexts must not undo earlier approved splits.
-                # DatasetWriter cannot read; only write original-parent pixels via row spans below.
-                mask=original==lab
+            for p,mask,candidate in edits:
+                lab=p['id'];x0,y0,x1,y1=p['xyxy']
+                # Write only changed spans, preserving other accepted edits in overlapping contexts.
                 for yy in range(mask.shape[0]):
                     cols=np.flatnonzero(mask[yy])
                     for chunk in np.split(cols,np.where(np.diff(cols)>1)[0]+1):
                         if len(chunk): dst.write(candidate[yy:yy+1,chunk[0]:chunk[-1]+1],1,window=Window(x0+int(chunk[0]),y0+yy,len(chunk),1))
-                mapping.append(dict(parent_id=lab,child_ids=p['child_ids'],residual_pixels=p['detail']['residual_pixels']))
+                mapping.append(dict(parent_id=lab,child_ids=p['child_ids'],residual_pixels=p['detail']['residual_pixels'],
+                    added_foreground_pixels=p['detail'].get('added_foreground_pixels',0)))
     sealed(project/'project.json')
     report=dict(status='complete',source_instances=m['instances'],source_sha256=digest(m['instances']),
         output_sha256=digest(output/'instance.tif'),accepted=mapping,ground_truth_used=False,
         proposals_sha256=digest(proposals_dir/'proposals.json'),approvals=read(approvals_path),
-        scope='Full-image export; only approved parent IDs relabeled; residual preserved; foreground unchanged')
+        scope='Full-image export; approved parent/background edits only; other existing IDs and unassigned pixels preserved')
     (output/'split_result.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
     print(f'Exported {output}/instance.tif; {len(mapping)} approved parent splits')
     return report
