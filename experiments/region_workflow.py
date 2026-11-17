@@ -184,15 +184,19 @@ def start(experiment,score_dir,method,reason,output,target_id=None):
             changes=np.diff(np.r_[0,line.astype(np.int8),0]);starts=np.flatnonzero(changes==1);ends=np.flatnonzero(changes==-1)
             allowed.append([[int(a),int(b)] for a,b in zip(starts,ends)])
         config=json.dumps(dict(hash=digest(output/'project.json'),id=anchor,ownership=ownership,allowed=allowed))
-        page=f'<!doctype html><meta charset="utf-8"><h1>融合后的区域正点交互</h1><p>起点：{method}。原因：{html.escape(reason)}。'
-        page+='<p>每个不同田块内部点一次，1至8点；只在未变暗的固定区域内标点。已有其他ID受保护。可撤销，不看GT边界选点。</p>'
+        page=f'<!doctype html><meta charset="utf-8"><h1>SAM 交互后处理：田块实例提取</h1><p>已有结果：{method}；本次目标ID：{anchor}。原因：{html.escape(reason)}。</p>'
+        page+='<p>本页只记录正点，不重新求交或求并，也不会直接运行SAM。先在想单独提取的一个田块内部点一次；导出 region_points.json 后运行 infer，才能查看SAM候选。</p>'
+        page+='<p>也可在多个不同田块内各点一次，共1至8点。只在未变暗的固定区域内标点；其他已有ID受保护，若需修改它们，请用 start --target-id 对应ID 新建项目。可撤销，不看GT边界选点。</p>'
         page+=f'<canvas id="canvas" width="{image.width}" height="{image.height}" style="max-width:96vw;height:auto"></canvas><p id="status"></p><button onclick="undo()">撤销</button><button onclick="download()">导出 region_points.json</button>'
     script=r'''
 const c=CONFIG,points=[],canvas=document.getElementById('canvas'),ctx=canvas.getContext('2d'),img=new Image(),began=Date.now();
 function draw(){ctx.drawImage(img,0,0);points.forEach((p,i)=>{ctx.beginPath();ctx.arc(p[0],p[1],6,0,Math.PI*2);ctx.fillStyle='red';ctx.fill();ctx.font='22px sans-serif';ctx.fillStyle='white';ctx.fillText(i+1,p[0]+8,p[1]);});
 document.getElementById('status').textContent=points.map((p,i)=>{let id=0;for(const r of c.ownership[p[1]]||[]){if(r[0]>p[0])break;id=r[1];}return '点'+(i+1)+': '+(id===0?'融合结果背景':id===c.id?'当前目标ID '+id:'其他已有ID '+id+'（保护）');}).join('；');}
 img.onload=draw;img.src=c.id+'_target.png';canvas.onclick=e=>{if(points.length>=8){alert('最多8点');return;}const r=canvas.getBoundingClientRect(),x=Math.floor((e.clientX-r.left)*canvas.width/r.width),y=Math.floor((e.clientY-r.top)*canvas.height/r.height);
-if(!(c.allowed[y]||[]).some(([a,b])=>x>=a&&x<b)){alert('这里是本轮固定区域以外的上下文，不会回写。请在未变暗区域点选。');return;}points.push([x,y]);draw();};
+if(!(c.allowed[y]||[]).some(([a,b])=>x>=a&&x<b)){alert('这里是本轮固定区域以外的上下文，不会回写。请在未变暗区域点选。');return;}
+let owner=0;for(const r of c.ownership[y]||[]){if(r[0]>x)break;owner=r[1];}
+if(owner!==0&&owner!==c.id){alert('此处属于已有实例ID '+owner+'，本项目保护该实例。若要修改它，请用 start --target-id '+owner+' 新建交互项目；本次点击未记录。');return;}
+points.push([x,y]);draw();};
 function undo(){points.pop();draw();}function download(){if(!points.length){alert('请标点');return;}const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify({project_sha256:c.hash,instances:[{id:c.id,points}],browser_wall_seconds:(Date.now()-began)/1000},null,2)],{type:'application/json'}));a.download='region_points.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}
 '''.replace('CONFIG',config)
     (output/'index.html').write_text(page+'<script>'+script+'</script>',encoding='utf-8')
