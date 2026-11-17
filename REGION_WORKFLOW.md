@@ -68,3 +68,32 @@ python -m experiments.region_workflow score --experiment-dir outputs/region_case
 最终表格保留 **original、center、union、intersection、interactive**。前四行应与首次评分完全相同，否则报错。interactive对应记录的start_method，分析其相对该融合起点的变化，而非只挑与最差方法比较。所有方法共用固定评分像素；该区域的分数不能直接与过去整个开发ROI的31.58%、47.62%等数字横比。
 
 记录：区域位置和面积、初始融合精度、进入交互原因、正点数量与重试次数、是否接受、交互后精度及成本。看过GT分数后对同一区域反复调参应保留每次尝试，不称首次盲测。来源与训练独立性尚未核实，结果仍是开发实验。所有输出目录拒绝覆盖，重试请改新名称。
+
+## 单点失败后：同一个田块的正负点联合交互
+
+若单点候选包含多条田块，不接受该候选，保留失败记录。创建独立项目，明确启用 `single-target`；旧默认模式仍是“一点对应一个不同田块”，两种标注不能混用。
+
+```bash
+python -m experiments.region_workflow start --experiment-dir outputs/region_case2 --fusion-scores outputs/region_case2_fusion_eval --fusion union --reason "Single positive merged adjacent parcels; test joint positive and negative prompts" --interaction-mode single-target --output-dir outputs/region_case2_posneg
+```
+
+打开新项目的index.html。保持“正点”选项，在目标条状田块内部点一下；切换“负点”，在上一轮误包含的相邻田块内部点一下。必要时在同一个目标内部补充正点，在其他误包含田块补充负点。红色为正点，蓝色为负点；最多8点，至少一个正点。其他已有ID可放负点，但不能放正点，且不会被候选覆盖。本项目只生成一个目标田块实例，不把每个正点当作一个新实例。
+
+导出region_points.json，放在outputs/region_case2_posneg目录内，再执行：
+
+```bash
+python -m experiments.region_workflow infer --project-dir outputs/region_case2_posneg --points outputs/region_case2_posneg/region_points.json --checkpoint "$HOME/xy/sam/segment-anything/sam_vit_b_01ec64.pth" --output-dir outputs/region_case2_posneg_proposals1
+```
+
+全部正负点在同一次SAM predict中传入，不使用粘连实例大框。候选必须包含全部正点且在SAM原始候选中排除负点，通过质量和面积阈值；其他ID继续受保护，未分配的父实例像素保留。阈值和正负点检查不保证田块边界正确，仍需人工复核。
+
+检查review.html，不满意就不勾选。返回本项目index.html，可恢复本项目上一次导出的JSON，撤销或补点后导出；保存为region_points_retry2.json，infer改用该文件并使用新的输出目录（如region_case2_posneg_proposals2）。这属于导出后重新推理，不是浏览器内实时SAM。保留每轮点文件、候选目录及耗时记录。
+
+候选合理时勾选，导出split_approvals.json并放入对应候选目录。例如接受第一轮：
+
+```bash
+python -m experiments.region_workflow apply --proposals-dir outputs/region_case2_posneg_proposals1 --approvals outputs/region_case2_posneg_proposals1/split_approvals.json --output-dir outputs/region_case2_posneg_result1
+python -m experiments.region_workflow score --experiment-dir outputs/region_case2 --gt "$HOME/xy/data/qgis_label_result3/instance.tif" --result-dir outputs/region_case2_posneg_result1 --output-dir outputs/region_case2_posneg_eval1
+```
+
+最终比较同一区域union与interactive指标，单点失败与正负点尝试分别记录。先前的单点项目JSON不能恢复到新项目（项目哈希不同），新项目第一次需重新点选。

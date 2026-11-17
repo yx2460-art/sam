@@ -116,7 +116,7 @@ c.onclick=e=>{const box=c.getBoundingClientRect();points[id].push([Math.floor((e
     return m
 
 
-def split_candidate(rgb,parent,points,predictor,min_area=30,min_score=.8,source=None,valid=None,diagnostic_sink=None,prompt_mode='point-box'):
+def split_candidate(rgb,parent,points,predictor,min_area=30,min_score=.8,source=None,valid=None,diagnostic_sink=None,prompt_mode='point-box',point_labels=None):
     """Reject ambiguous masks; never manufacture a geometric split if SAM cannot separate seeds."""
     flexible=source is not None
     if prompt_mode not in ('point-box','point-only'): raise ValueError('Unknown prompt mode')
@@ -131,12 +131,21 @@ def split_candidate(rgb,parent,points,predictor,min_area=30,min_score=.8,source=
         if not flexible and not parent[y,x]: raise ValueError('Positive point outside selected instance')
         seeds.append((x,y))
     if len(set(seeds))!=len(seeds): raise ValueError('Duplicate seeds')
+    grouped=point_labels is not None
+    if grouped:
+        if len(point_labels)!=len(points) or any(type(v) is not int or v not in (0,1) for v in point_labels) or 1 not in point_labels:
+            raise ValueError('Grouped prompts require binary labels and at least one positive')
+        positives=[p for p,label in zip(seeds,point_labels) if label==1]
+        negatives=[p for p,label in zip(seeds,point_labels) if label==0]
+        if flexible and any(source[y,x]>0 and not parent[y,x] for x,y in positives):
+            raise ValueError('Positive belongs to another protected instance')
+        prompts=seeds;seeds=[positives[0]]
     predictor.set_image(rgb);ys,xs=np.where(parent)
     box=np.array([xs.min(),ys.min(),xs.max(),ys.max()],dtype=np.float32) if xs.size else np.array([0,0,parent.shape[1]-1,parent.shape[0]-1],dtype=np.float32)
     logits=[];details=[];rejected=[];diagnostics=[]
     support=(parent|(source==0))&valid if flexible else parent
     for index,(x,y) in enumerate(seeds):
-        prompt_box=None if prompt_mode=='point-only' or (flexible and source[y,x]==0) else box
+        prompt_box=None if grouped or prompt_mode=='point-only' or (flexible and source[y,x]==0) else box
         seed_record=dict(seed=index,point=[x,y],candidates=[],status='pending',
                          prompt_mode=prompt_mode,box=None if prompt_box is None else prompt_box.tolist())
         diagnostics.append(seed_record)
@@ -144,8 +153,8 @@ def split_candidate(rgb,parent,points,predictor,min_area=30,min_score=.8,source=
             seed_record.update(status='protected',source_id=int(source[y,x]))
             rejected.append(dict(seed=index,source_id=int(source[y,x]),reason='Point belongs to another existing instance; protected, open that instance separately'))
             continue
-        masks,quality,_=predictor.predict(point_coords=np.array([[x,y]],dtype=np.float32),
-            point_labels=np.ones(1,dtype=np.int32),box=prompt_box,
+        masks,quality,_=predictor.predict(point_coords=np.array(prompts if grouped else [[x,y]],dtype=np.float32),
+            point_labels=np.array(point_labels if grouped else [1],dtype=np.int32),box=prompt_box,
             multimask_output=True,return_logits=True)
         candidates=[]
         for candidate_index,(raw,score) in enumerate(zip(masks,quality)):
@@ -162,6 +171,8 @@ def split_candidate(rgb,parent,points,predictor,min_area=30,min_score=.8,source=
             if not finite: reasons.append('non_finite_mask')
             if not contains_own: reasons.append('own_point_missing')
             if other: reasons.append('contains_other_points')
+            if grouped and any(not component[yy,xx] for xx,yy in positives): reasons.append('positive_missing')
+            if grouped and any(raw_mask[yy,xx] for xx,yy in negatives): reasons.append('negative_included')
             if contains_own and component.sum()<min_area: reasons.append('too_small')
             record=dict(seed=index,candidate=candidate_index,score=float(score) if finite_score else None,
                 min_score=min_score,min_area=min_area,mask_threshold=float(predictor.model.mask_threshold),
@@ -173,6 +184,8 @@ def split_candidate(rgb,parent,points,predictor,min_area=30,min_score=.8,source=
                 touches_context_edge=bool(component[0].any() or component[-1].any() or component[:,0].any() or component[:,-1].any()),
                 rejection_codes=reasons,eligible=not reasons,selected=False)
             seed_record['candidates'].append(record)
+            if grouped:
+                record.update(prompt_points=points,point_labels=point_labels)
             if diagnostic_sink: diagnostic_sink(record,raw_mask,binary,component)
             if reasons: continue
             candidates.append((float(score),raw,component,candidate_index))
@@ -219,6 +232,9 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
     if selection['project_sha256']!=digest(project/'project.json'): raise ValueError('Points belong to another project')
     regions={r['id']:r for r in m['regions']};items=selection['instances'];seen=set()
     if not items: raise ValueError('No selected instances')
+    grouped=selection.get('interaction_mode')=='single-target'
+    if selection.get('interaction_mode') not in (None,'single-target'): raise ValueError('Unknown interaction mode')
+    if not grouped and any('point_labels' in item for item in items): raise ValueError('Labels require single-target interaction mode')
     # Validate all annotations before loading SAM.
     with rasterio.open(m['instances']) as src,rasterio.open(m['image']) as image:
         for item in items:
@@ -229,6 +245,9 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
             original=src.read(1,window=win);valid=np.all(image.read_masks(m['rgb_bands'],window=win)>0,axis=0)
             valid &= np.isfinite(image.read(m['rgb_bands'],window=win)).all(axis=0)
             if not 1<=len(pts)<=8 or len({tuple(p) for p in pts})!=len(pts): raise ValueError('Need 1 to 8 distinct points')
+            labels=item.get('point_labels')
+            if grouped and (not isinstance(labels,list) or len(labels)!=len(pts) or any(type(v) is not int or v not in (0,1) for v in labels) or 1 not in labels):
+                raise ValueError('Grouped prompts require binary labels and at least one positive')
             item['point_roles']=[]
             for number,p in enumerate(pts,1):
                 if len(p)!=2 or any(type(v) is not int for v in p): raise ValueError('Integer pixel points required')
@@ -236,6 +255,7 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
                 if not (0<=y<parent.shape[0] and 0<=x<parent.shape[1] and valid[y,x]):
                     raise ValueError(f'Instance {lab}, point {number}: outside valid image context; coordinate ({x},{y})')
                 actual=int(original[y,x]);kind='background' if actual==0 else 'parent' if actual==lab else 'other_instance'
+                if grouped and labels[number-1]==1 and actual not in (0,lab): raise ValueError('Positive belongs to another protected instance')
                 item['point_roles'].append(dict(point=number,source_id=actual,kind=kind))
                 print(f'Instance {lab}, point {number}: {kind}, existing ID={actual}',flush=True)
     if m['max_source_id']+sum(len(r['points']) for r in items)>np.iinfo(np.uint32).max: raise ValueError('ID overflow')
@@ -252,9 +272,10 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
             valid=np.all(image.read_masks(m['rgb_bands'],window=win)>0,axis=0)&np.isfinite(image.read(m['rgb_bands'],window=win)).all(axis=0)
             from .split_diagnostics import image_sink
             sink=image_sink(output/'diagnostics',lab,rgb)
-            patch,detail=split_candidate(rgb,parent,item['points'],predictor,min_area,min_score,source=original,valid=valid,diagnostic_sink=sink,prompt_mode=prompt_mode)
+            patch,detail=split_candidate(rgb,parent,item['points'],predictor,min_area,min_score,source=original,valid=valid,diagnostic_sink=sink,prompt_mode=prompt_mode,point_labels=item.get('point_labels') if grouped else None)
             entry=dict(id=lab,xyxy=row['xyxy'],points=item['points'],point_roles=item['point_roles'],
                        detail=detail,status='rejected',editable='parent_and_background')
+            if grouped: entry['point_labels']=item['point_labels']
             shutil.copyfile(project/f'{lab}_target.png',output/f'{lab}_before.png')
             if patch is not None:
                 ids=list(range(next_id,next_id+len(detail['children'])));next_id+=len(ids)
@@ -273,7 +294,7 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
     if any(digest(p)!=value for p,value in hashes.items()): raise ValueError('Inputs changed during inference')
     report=dict(status='ready_for_review',operation='parent_refinement_and_background_completion',
         project=str(project),project_sha256=digest(project/'project.json'),
-        proposals=proposals,min_area=min_area,min_score=min_score,prompt_mode=prompt_mode,input_sha256=hashes,ground_truth_used=False)
+        proposals=proposals,min_area=min_area,min_score=min_score,prompt_mode=prompt_mode,interaction_mode='single-target' if grouped else 'separate-parcels',input_sha256=hashes,ground_truth_used=False)
     (output/'proposals.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
     cards=[]
     for r in proposals:
@@ -284,6 +305,7 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
         import html
         for role in r['point_roles']:
             label={'parent':'当前实例内，参与细分','background':'原预测背景，参与补充候选','other_instance':'已有其他实例，保持保护；如需修改请打开对应ID'}[role['kind']]
+            if grouped: label='同一目标正点' if r['point_labels'][role['point']-1] else '负点：排除该处，不修改该处已有实例'
             card+=f'<p>点{role["point"]}：{label}，原ID={role["source_id"]}</p>'
         for rejected in r['detail'].get('rejected_seeds',[]):
             card+=f'<p>点{rejected["seed"]+1}未生成候选：{html.escape(rejected["reason"])}</p>'
@@ -291,7 +313,7 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
         cards.append(card)
     config=json.dumps(dict(hash=digest(output/'proposals.json'),ids=[r['id'] for r in proposals if r['status']=='proposal']))
     script='const c='+config+''';function download(){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify({proposals_sha256:c.hash,accepted_ids:c.ids.filter(id=>document.getElementById('a'+id).checked)},null,2)],{type:'application/json'}));a.download='split_approvals.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}'''
-    (output/'review.html').write_text('<!doctype html><meta charset="utf-8"><h1>拆分候选确认</h1><p>提示模式：'+prompt_mode+'。未勾选即保留原实例。不看GT后挑选。</p><button onclick="download()">导出确认JSON</button>'+''.join(cards)+'<script>'+script+'</script>',encoding='utf-8')
+    (output/'review.html').write_text('<!doctype html><meta charset="utf-8"><h1>拆分候选确认</h1><p>交互：'+('同一目标正负点联合提示' if grouped else '不同田块独立正点')+'；提示模式：'+prompt_mode+'。未勾选即保留原实例。不看GT后挑选。</p><button onclick="download()">导出确认JSON</button>'+''.join(cards)+'<script>'+script+'</script>',encoding='utf-8')
     from .split_diagnostics import write_report
     write_report(output,proposals,min_area,min_score)
     lines=[f'Prompt mode: {prompt_mode}; min_score={min_score}; min_area={min_area}; no GT read.',

@@ -16,6 +16,45 @@ from experiments.region_workflow import prepare,fusion_scores,start,infer,apply
 
 
 class RegionWorkflowTests(unittest.TestCase):
+    def test_joint_prompts_reach_sam_and_keep_one_child_through_export(self):
+        class JointPredictor:
+            model=SimpleNamespace(mask_threshold=0)
+            def set_image(self,rgb): self.shape=rgb.shape[:2]
+            def predict(self,point_coords,point_labels,box,**kwargs):
+                np.testing.assert_equal(point_labels,[0,1,1])
+                np.testing.assert_equal(point_coords,[[5,14],[5,5],[6,6]])
+                self.called=True
+                assert box is None
+                bad=np.full(self.shape,5.0)
+                good=np.full(self.shape,-5.0);good[2:10,2:10]=5
+                return np.array([bad,good]),np.array([.99,.95]),None
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);args=test_conflict_regions.RegionTests().fixture(root)
+            prepare(root/'tiles',root/'region',bounds=[4,4,16,16],context=2)
+            fusion_scores(root/'region',args.gt,root/'scores')
+            start(root/'region',root/'scores','union','single point failed',root/'interaction',interaction_mode='single-target')
+            project=json.loads((root/'interaction'/'project.json').read_text());anchor=project['regions'][0]['id']
+            points=dict(project_sha256=digest(root/'interaction'/'project.json'),interaction_mode='single-target',
+                instances=[dict(id=anchor,points=[[5,14],[5,5],[6,6]],point_labels=[0,1,1])])
+            (root/'points.json').write_text(json.dumps(points))
+            predictor=JointPredictor()
+            proposals=infer(root/'interaction',root/'points.json',args.checkpoint,root/'proposals',predictor=predictor)
+            self.assertTrue(predictor.called)
+            p=proposals['proposals'][0];self.assertEqual(p['status'],'proposal')
+            self.assertEqual(len(p['child_ids']),1)
+            self.assertIn('negative_included',p['detail']['diagnostics'][0]['candidates'][0]['rejection_codes'])
+            self.assertEqual(p['detail']['children'][0]['candidate'],1)
+            (root/'approve.json').write_text(json.dumps(dict(proposals_sha256=digest(root/'proposals'/'proposals.json'),accepted_ids=[anchor])))
+            apply(root/'proposals',root/'approve.json',root/'result')
+            with rasterio.open(root/'region'/'union.tif') as src:before=src.read(1)
+            with rasterio.open(root/'result'/'region_result.tif') as src:after=src.read(1)
+            self.assertEqual(before[14,5],after[14,5]);self.assertNotEqual(before[5,5],after[5,5])
+            fusion_scores(root/'region',args.gt,root/'final',root/'result')
+            points['instances'][0]['point_labels']=[0,0,0]
+            (root/'invalid.json').write_text(json.dumps(points))
+            with self.assertRaisesRegex(ValueError,'at least one positive'):
+                infer(root/'interaction',root/'invalid.json',args.checkpoint,root/'invalid',predictor=predictor)
+
     def test_fusion_scores_then_interaction_use_fused_source_and_same_region(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder);args=test_conflict_regions.RegionTests().fixture(root)

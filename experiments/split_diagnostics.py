@@ -16,6 +16,8 @@ REASONS={
     'own_point_missing':'限制范围后，候选未覆盖自己的正点',
     'contains_other_points':'候选连通区域同时包含其他田块正点',
     'too_small':'自己的连通区域小于最小面积',
+    'positive_missing':'同一目标的正点未全部位于同一候选连通区域',
+    'negative_included':'SAM原始候选仍覆盖负点',
 }
 STATUSES={
     'protected':'已有其他实例，未调用SAM，保持保护',
@@ -45,10 +47,11 @@ def image_sink(directory,parent_id,rgb):
     return save
 
 
-def panel(path,points,width,height):
+def panel(path,points,width,height,labels=None):
     circles=''
     for i,(x,y) in enumerate(points,1):
-        circles+=f'<circle cx="{x}" cy="{y}" r="7" fill="red" stroke="white"/><text x="{x+10}" y="{y}" fill="white" stroke="black" stroke-width=".5" font-size="24">{i}</text>'
+        color='blue' if labels is not None and labels[i-1]==0 else 'red'
+        circles+=f'<circle cx="{x}" cy="{y}" r="7" fill="{color}" stroke="white"/><text x="{x+10}" y="{y}" fill="white" stroke="black" stroke-width=".5" font-size="24">{i}</text>'
     return (f'<svg viewBox="0 0 {width} {height}" style="width:100%"><image href="{html.escape(path)}" '
             f'width="{width}" height="{height}"/>{circles}</svg>')
 
@@ -75,7 +78,7 @@ def write_report(output,proposals,min_area,min_score):
                     f'原始掩膜覆盖正点 {candidate["raw_contains_points"]}，连通区域包含其他正点 {candidate["component_contains_other_points"]}。'
                     f'自己的正点在原始掩膜内：{candidate["own_point_in_raw"]}；连通区域触及上下文边缘：{candidate["touches_context_edge"]}。</p>')
                 images=candidate.get('images',{})
-                cards.append('<div class="panels">'+''.join('<figure>'+panel(images[name],points,x1-x0,y1-y0)+f'<figcaption>{label}</figcaption></figure>'
+                cards.append('<div class="panels">'+''.join('<figure>'+panel(images[name],points,x1-x0,y1-y0,proposal.get('point_labels'))+f'<figcaption>{label}</figcaption></figure>'
                     for name,label in (('raw','SAM原始掩膜（仅阈值化，未限制修改范围）'),('supported','保护其他实例及无效影像区域后'),('component','与当前正点连通的区域')) if name in images)+'</div></article>')
                 rows.append(dict(instance_id=lab,point=seed['seed']+1,candidate=candidate['candidate']+1,
                     final_point_status=seed['status'],score=candidate['score'],eligible=candidate['eligible'],
@@ -88,12 +91,12 @@ def write_report(output,proposals,min_area,min_score):
           '<h1>SAM逐点原始候选与拒绝原因</h1>'
           f'<p>固定质量阈值 {min_score}，最小面积 {min_area} 像素。本页不读取GT、不改变筛选条件。'
           '蓝色填充为候选范围，黄色为其边界，红点为人工标注。分数是SAM预测质量，不是与GT计算的真实IoU。'
-          '同一候选可能同时不满足多条规则；“包含其他点”由程序事后检查，并非把这些点输入SAM作为负点。'
+          '红点为正点，蓝点为负点。单目标模式的全部正负点共同输入SAM；旧的独立田块模式中，“包含其他点”是事后检查，不是负点提示。'
           '原始掩膜可延伸到不允许修改的区域，仅用于诊断，不能从本页直接接受或导出。</p>'
           '<p><a href="review.html">返回候选确认页</a></p>'+''.join(cards)+'</html>')
     (output/'diagnostics.html').write_text(page,encoding='utf-8')
     (output/'diagnostics.json').write_text(json.dumps(dict(min_area=min_area,min_score=min_score,
-        ground_truth_used=False,instances=[dict(id=p['id'],points=p['points'],diagnostics=p['detail'].get('diagnostics',[])) for p in proposals]),indent=2),encoding='utf-8')
+        ground_truth_used=False,instances=[dict(id=p['id'],points=p['points'],point_labels=p.get('point_labels'),diagnostics=p['detail'].get('diagnostics',[])) for p in proposals]),indent=2),encoding='utf-8')
     with (output/'diagnostics.csv').open('w',newline='',encoding='utf-8-sig') as stream:
         columns=list(rows[0]) if rows else ['instance_id','point','candidate','rejection_codes']
         writer=csv.DictWriter(stream,fieldnames=columns);writer.writeheader();writer.writerows(rows)

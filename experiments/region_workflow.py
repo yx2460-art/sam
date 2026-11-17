@@ -152,7 +152,8 @@ def fusion_scores(experiment,gt_path,output,result_dir=None):
     return score
 
 
-def start(experiment,score_dir,method,reason,output,target_id=None):
+def start(experiment,score_dir,method,reason,output,target_id=None,interaction_mode='separate-parcels'):
+    if interaction_mode not in ('separate-parcels','single-target'): raise ValueError('Unknown interaction mode')
     experiment,m=load(experiment);score_dir=Path(score_dir).resolve();output=Path(output).resolve()
     if output.exists(): raise FileExistsError('Use a new interaction directory')
     first=sealed(score_dir/'scores.json')
@@ -183,25 +184,38 @@ def start(experiment,score_dir,method,reason,output,target_id=None):
         for line in mask:
             changes=np.diff(np.r_[0,line.astype(np.int8),0]);starts=np.flatnonzero(changes==1);ends=np.flatnonzero(changes==-1)
             allowed.append([[int(a),int(b)] for a,b in zip(starts,ends)])
-        config=json.dumps(dict(hash=digest(output/'project.json'),id=anchor,ownership=ownership,allowed=allowed))
+        config=json.dumps(dict(hash=digest(output/'project.json'),id=anchor,ownership=ownership,allowed=allowed,mode=interaction_mode))
         page=f'<!doctype html><meta charset="utf-8"><h1>SAM 交互后处理：田块实例提取</h1><p>已有结果：{method}；本次目标ID：{anchor}。原因：{html.escape(reason)}。</p>'
         page+='<p>本页只记录正点，不重新求交或求并，也不会直接运行SAM。先在想单独提取的一个田块内部点一次；导出 region_points.json 后运行 infer，才能查看SAM候选。</p>'
         page+='<p>也可在多个不同田块内各点一次，共1至8点。只在未变暗的固定区域内标点；其他已有ID受保护，若需修改它们，请用 start --target-id 对应ID 新建项目。可撤销，不看GT边界选点。</p>'
+        if interaction_mode=='single-target':
+            page=f'<!doctype html><meta charset="utf-8"><h1>SAM 单田块正负点交互</h1><p>起点：{method}；目标ID：{anchor}；原因：{html.escape(reason)}。</p>'
+            page+='<p>本页只提取一个田块。正点（红色）放在目标内部，负点（蓝色）放在被误包含的邻近田块。所有点共同输入SAM，最多8点，至少一个正点。不重新求并，不看GT。仅亮区可标点，其他已有ID允许负点但不会被覆盖。</p>'
+            page+='<label>点击类型：<select id="polarity"><option value="1">正点：保留目标</option><option value="0">负点：排除邻块</option></select></label><p>补点重试：恢复本项目上一次导出的JSON，补点后再次导出；infer使用新的输出目录。</p><input type="file" accept=".json" onchange="restore(this)">'
         page+=f'<canvas id="canvas" width="{image.width}" height="{image.height}" style="max-width:96vw;height:auto"></canvas><p id="status"></p><button onclick="undo()">撤销</button><button onclick="download()">导出 region_points.json</button>'
     script=r'''
-const c=CONFIG,points=[],canvas=document.getElementById('canvas'),ctx=canvas.getContext('2d'),img=new Image(),began=Date.now();
-function draw(){ctx.drawImage(img,0,0);points.forEach((p,i)=>{ctx.beginPath();ctx.arc(p[0],p[1],6,0,Math.PI*2);ctx.fillStyle='red';ctx.fill();ctx.font='22px sans-serif';ctx.fillStyle='white';ctx.fillText(i+1,p[0]+8,p[1]);});
+const c=CONFIG,points=[],labels=[],canvas=document.getElementById('canvas'),ctx=canvas.getContext('2d'),img=new Image(),began=Date.now();
+function draw(){ctx.drawImage(img,0,0);points.forEach((p,i)=>{ctx.beginPath();ctx.arc(p[0],p[1],6,0,Math.PI*2);ctx.fillStyle=labels[i]===0?'#0088ff':'red';ctx.fill();ctx.font='22px sans-serif';ctx.fillStyle='white';ctx.fillText((labels[i]===0?'-':'+')+(i+1),p[0]+8,p[1]);});
 document.getElementById('status').textContent=points.map((p,i)=>{let id=0;for(const r of c.ownership[p[1]]||[]){if(r[0]>p[0])break;id=r[1];}return '点'+(i+1)+': '+(id===0?'融合结果背景':id===c.id?'当前目标ID '+id:'其他已有ID '+id+'（保护）');}).join('；');}
 img.onload=draw;img.src=c.id+'_target.png';canvas.onclick=e=>{if(points.length>=8){alert('最多8点');return;}const r=canvas.getBoundingClientRect(),x=Math.floor((e.clientX-r.left)*canvas.width/r.width),y=Math.floor((e.clientY-r.top)*canvas.height/r.height);
 if(!(c.allowed[y]||[]).some(([a,b])=>x>=a&&x<b)){alert('这里是本轮固定区域以外的上下文，不会回写。请在未变暗区域点选。');return;}
 let owner=0;for(const r of c.ownership[y]||[]){if(r[0]>x)break;owner=r[1];}
-if(owner!==0&&owner!==c.id){alert('此处属于已有实例ID '+owner+'，本项目保护该实例。若要修改它，请用 start --target-id '+owner+' 新建交互项目；本次点击未记录。');return;}
-points.push([x,y]);draw();};
-function undo(){points.pop();draw();}function download(){if(!points.length){alert('请标点');return;}const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify({project_sha256:c.hash,instances:[{id:c.id,points}],browser_wall_seconds:(Date.now()-began)/1000},null,2)],{type:'application/json'}));a.download='region_points.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}
+const label=c.mode==='single-target'?Number(document.getElementById('polarity').value):1;
+if(label===1&&owner!==0&&owner!==c.id){alert('此处属于已有实例ID '+owner+'，本项目保护该实例。若要修改它，请用 start --target-id '+owner+' 新建交互项目；本次点击未记录。');return;}
+if(points.some(p=>p[0]===x&&p[1]===y)){alert('此坐标已标点，请撤销后重选');return;}
+points.push([x,y]);labels.push(label);draw();};
+function undo(){points.pop();labels.pop();draw();}
+async function restore(input){try{const v=JSON.parse(await input.files[0].text()),r=v.instances[0];
+if(v.project_sha256!==c.hash||v.interaction_mode!=='single-target'||v.instances.length!==1||r.id!==c.id||!Array.isArray(r.points)||!Array.isArray(r.point_labels)||r.points.length!==r.point_labels.length||r.points.length>8)throw Error('请选择本项目导出的正负点JSON');
+if(r.points.some((p,i)=>!Array.isArray(p)||p.length!==2||!p.every(Number.isInteger)||![0,1].includes(r.point_labels[i])||!(c.allowed[p[1]]||[]).some(([a,b])=>p[0]>=a&&p[0]<b)))throw Error('点格式或区域不匹配');
+points.splice(0,points.length,...r.points);labels.splice(0,labels.length,...r.point_labels);draw();}catch(e){alert(e.message);}}
+function download(){if(!points.length||!labels.includes(1)){alert('至少需要一个正点');return;}const row={id:c.id,points},v={project_sha256:c.hash,instances:[row],browser_wall_seconds:(Date.now()-began)/1000};
+if(c.mode==='single-target'){v.interaction_mode=c.mode;row.point_labels=labels;}
+const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(v,null,2)],{type:'application/json'}));a.download='region_points.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}
 '''.replace('CONFIG',config)
     (output/'index.html').write_text(page+'<script>'+script+'</script>',encoding='utf-8')
     workflow=dict(status='ready',experiment=str(experiment),experiment_sha256=digest(experiment/'experiment.json'),
-        fusion_scores=str(score_dir),start_method=method,reason=reason,target_id=anchor,mask=m['mask'],
+        fusion_scores=str(score_dir),start_method=method,reason=reason,target_id=anchor,interaction_mode=interaction_mode,mask=m['mask'],
         input_sha256={str(p):digest(p) for p in (experiment/'experiment.json',score_dir/'scores.json',output/'project.json')})
     write_json(output/'workflow.json',workflow);print(f'Open {output}/index.html; start={method}; no GT read')
     return workflow
@@ -209,6 +223,7 @@ function undo(){points.pop();draw();}function download(){if(!points.length){aler
 
 def infer(project,points,checkpoint,output,device='cuda:0',predictor=None):
     project=Path(project).resolve();w=sealed(project/'workflow.json');annotation=read(points)
+    if annotation.get('interaction_mode','separate-parcels')!=w.get('interaction_mode','separate-parcels'): raise ValueError('Annotation interaction mode differs from project')
     _,m=load(w['experiment'])
     if digest(checkpoint)!=m['checkpoint_sha256']: raise ValueError('Use the same SAM checkpoint as the fusion source run')
     with rasterio.open(w['mask']) as src: mask=src.read(1)>0
@@ -249,6 +264,7 @@ def main():
     p.add_argument('--output-dir',type=Path,required=True);p.add_argument('--result-dir',type=Path)
     p=sub.add_parser('start');p.add_argument('--experiment-dir',type=Path,required=True);p.add_argument('--fusion-scores',type=Path,required=True)
     p.add_argument('--target-id',type=int,help='Explicit existing ID to refine; other existing IDs remain protected')
+    p.add_argument('--interaction-mode',choices=['separate-parcels','single-target'],default='separate-parcels',help='single-target jointly prompts one parcel using positive and negative points')
     p.add_argument('--fusion',choices=['union','intersection','center','original'],required=True);p.add_argument('--reason',required=True);p.add_argument('--output-dir',type=Path,required=True)
     p=sub.add_parser('infer');p.add_argument('--project-dir',type=Path,required=True);p.add_argument('--points',type=Path,required=True)
     p.add_argument('--checkpoint',type=Path,required=True);p.add_argument('--output-dir',type=Path,required=True);p.add_argument('--device',default='cuda:0')
@@ -256,7 +272,7 @@ def main():
     a=parser.parse_args()
     if a.command=='prepare': prepare(a.run_dir,a.output_dir,a.instance_id,a.bounds,a.padding,a.context)
     elif a.command=='score': fusion_scores(a.experiment_dir,a.gt,a.output_dir,a.result_dir)
-    elif a.command=='start': start(a.experiment_dir,a.fusion_scores,a.fusion,a.reason,a.output_dir,a.target_id)
+    elif a.command=='start': start(a.experiment_dir,a.fusion_scores,a.fusion,a.reason,a.output_dir,a.target_id,a.interaction_mode)
     elif a.command=='infer': infer(a.project_dir,a.points,a.checkpoint,a.output_dir,a.device)
     else: apply(a.proposals_dir,a.approvals,a.output_dir)
 
