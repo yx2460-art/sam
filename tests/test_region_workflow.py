@@ -1,0 +1,100 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import numpy as np
+import rasterio
+
+import test_conflict_regions
+import test_split_instances
+from experiments.run_tiles import run as run_tiles
+from experiments.run_tiles import digest
+from experiments.region_workflow import prepare,fusion_scores,start,infer,apply
+
+
+class RegionWorkflowTests(unittest.TestCase):
+    def test_fusion_scores_then_interaction_use_fused_source_and_same_region(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);args=test_conflict_regions.RegionTests().fixture(root)
+            original_bytes=(root/'prediction.tif').read_bytes();actual=rasterio.open
+            def no_gt(path,*a,**kw):
+                self.assertNotEqual(Path(path).resolve(),args.gt.resolve())
+                return actual(path,*a,**kw)
+            experiment=root/'region'
+            with patch('rasterio.open',side_effect=no_gt):
+                m=prepare(root/'tiles',experiment,bounds=[4,4,16,16],context=2)
+            self.assertEqual(m['scoring_pixels'],256)
+            first=fusion_scores(experiment,args.gt,root/'fusion_eval')
+            self.assertEqual(set(first['evaluation']),{'original','center','union','intersection'})
+            with patch('rasterio.open',side_effect=no_gt):
+                start(experiment,root/'fusion_eval','union','visually merged despite fusion',root/'interaction')
+                project=json.loads((root/'interaction'/'project.json').read_text())
+                self.assertEqual(project['instances'],m['candidates']['union'])
+                anchor=project['regions'][0]['id']
+                points=dict(project_sha256=digest(root/'interaction'/'project.json'),instances=[dict(id=anchor,points=[[8,5],[8,14]])])
+                (root/'points.json').write_text(json.dumps(points))
+                proposals=infer(root/'interaction',root/'points.json',args.checkpoint,root/'proposals',predictor=test_split_instances.Predictor())
+                self.assertEqual(proposals['prompt_mode'],'point-only')
+                self.assertEqual(proposals['proposals'][0]['status'],'proposal')
+                approved=dict(proposals_sha256=digest(root/'proposals'/'proposals.json'),accepted_ids=[anchor])
+                (root/'approval.json').write_text(json.dumps(approved))
+                result=apply(root/'proposals',root/'approval.json',root/'result')
+                with actual(m['mask']) as src:mask=src.read(1)>0
+                with actual(m['candidates']['union']) as src:before=src.read(1)
+                with actual(root/'result'/'region_result.tif') as src:after=src.read(1)
+                np.testing.assert_equal(before[~mask],after[~mask])
+                self.assertGreater(result['changed_pixels'],0)
+            final=fusion_scores(experiment,args.gt,root/'post_eval',root/'result')
+            for name in first['evaluation']:
+                self.assertEqual(first['evaluation'][name],final['evaluation'][name])
+            self.assertIn('interactive',final['evaluation'])
+            self.assertEqual(final['scoring_pixels'],256)
+            self.assertEqual(original_bytes,(root/'prediction.tif').read_bytes())
+            with rasterio.open(root/'gt.tif','r+') as gt:
+                a=gt.read(1);a[4,4]=8;gt.write(a,1)
+            with self.assertRaisesRegex(ValueError,'GT differs'):
+                fusion_scores(experiment,args.gt,root/'wrong_gt',root/'result')
+
+    def test_first_scores_required_and_dark_context_points_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);args=test_conflict_regions.RegionTests().fixture(root)
+            m=prepare(root/'tiles',root/'region',bounds=[4,4,8,8],context=2)
+            with self.assertRaises(FileNotFoundError):
+                start(root/'region',root/'missing','union','merged',root/'blocked')
+            fusion_scores(root/'region',args.gt,root/'scores')
+            start(root/'region',root/'scores','intersection','merged',root/'interaction')
+            p=json.loads((root/'interaction'/'project.json').read_text())
+            points=dict(project_sha256=digest(root/'interaction'/'project.json'),instances=[dict(id=p['regions'][0]['id'],points=[[0,0]])])
+            (root/'points.json').write_text(json.dumps(points))
+            with self.assertRaisesRegex(ValueError,'outside the fixed'):
+                infer(root/'interaction',root/'points.json',args.checkpoint,root/'invalid',predictor=test_split_instances.Predictor())
+
+    def test_empty_fusion_can_start_single_background_point_and_export_fixed_region(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);args=test_conflict_regions.RegionTests().fixture(root)
+            params=json.loads((root/'tiles'/'manifest.json').read_text())['parameters']
+            params['output_dir']=root/'empty_tiles'
+            run_tiles(SimpleNamespace(**params),refine=lambda rgb,original,predictor,options:(np.zeros_like(original),[]))
+            m=prepare(root/'empty_tiles',root/'region',bounds=[4,4,8,8],context=2)
+            fusion_scores(root/'region',args.gt,root/'scores')
+            workflow=start(root/'region',root/'scores','intersection','fusion removed parcel foreground',root/'interaction')
+            self.assertEqual(workflow['target_id'],0)
+            points=dict(project_sha256=digest(root/'interaction'/'project.json'),instances=[dict(id=0,points=[[5,5]])])
+            (root/'points.json').write_text(json.dumps(points))
+            proposals=infer(root/'interaction',root/'points.json',args.checkpoint,root/'proposals',predictor=test_split_instances.Predictor())
+            self.assertEqual(proposals['proposals'][0]['point_roles'][0]['kind'],'background')
+            self.assertEqual(proposals['proposals'][0]['status'],'proposal')
+            approval=dict(proposals_sha256=digest(root/'proposals'/'proposals.json'),accepted_ids=[0])
+            (root/'approval.json').write_text(json.dumps(approval))
+            apply(root/'proposals',root/'approval.json',root/'result')
+            with rasterio.open(root/'result'/'region_result.tif') as src:data=src.read(1)
+            with rasterio.open(m['mask']) as src:mask=src.read(1)>0
+            self.assertTrue(np.any(data[mask]>0));self.assertTrue(np.all(data[~mask]==0))
+            final=fusion_scores(root/'region',args.gt,root/'final',root/'result')
+            self.assertGreater(final['evaluation']['interactive']['mask_iou'],final['evaluation']['intersection']['mask_iou'])
+
+
+if __name__=='__main__': unittest.main()

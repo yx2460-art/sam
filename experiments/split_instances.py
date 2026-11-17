@@ -132,7 +132,7 @@ def split_candidate(rgb,parent,points,predictor,min_area=30,min_score=.8,source=
         seeds.append((x,y))
     if len(set(seeds))!=len(seeds): raise ValueError('Duplicate seeds')
     predictor.set_image(rgb);ys,xs=np.where(parent)
-    box=np.array([xs.min(),ys.min(),xs.max(),ys.max()],dtype=np.float32)
+    box=np.array([xs.min(),ys.min(),xs.max(),ys.max()],dtype=np.float32) if xs.size else np.array([0,0,parent.shape[1]-1,parent.shape[0]-1],dtype=np.float32)
     logits=[];details=[];rejected=[];diagnostics=[]
     support=(parent|(source==0))&valid if flexible else parent
     for index,(x,y) in enumerate(seeds):
@@ -235,7 +235,7 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
                 x,y=p
                 if not (0<=y<parent.shape[0] and 0<=x<parent.shape[1] and valid[y,x]):
                     raise ValueError(f'Instance {lab}, point {number}: outside valid image context; coordinate ({x},{y})')
-                actual=int(original[y,x]);kind='parent' if actual==lab else 'background' if actual==0 else 'other_instance'
+                actual=int(original[y,x]);kind='background' if actual==0 else 'parent' if actual==lab else 'other_instance'
                 item['point_roles'].append(dict(point=number,source_id=actual,kind=kind))
                 print(f'Instance {lab}, point {number}: {kind}, existing ID={actual}',flush=True)
     if m['max_source_id']+sum(len(r['points']) for r in items)>np.iinfo(np.uint32).max: raise ValueError('ID overflow')
