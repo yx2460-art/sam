@@ -50,6 +50,39 @@ class RegionWorkflowTests(unittest.TestCase):
             with rasterio.open(root/'result'/'region_result.tif') as src:after=src.read(1)
             self.assertEqual(before[14,5],after[14,5]);self.assertNotEqual(before[5,5],after[5,5])
             fusion_scores(root/'region',args.gt,root/'final',root/'result')
+            # A second parcel is extracted from the last approved raster, not from union.
+            start(root/'region',root/'scores','union','next parcel',root/'round2',target_id=anchor,
+                  interaction_mode='single-target',from_result=root/'result')
+            second_project=json.loads((root/'round2'/'project.json').read_text())
+            self.assertEqual(Path(second_project['instances']),root/'result'/'region_result.tif')
+            self.assertGreaterEqual(second_project['max_source_id'],max(p['child_ids']))
+            class SecondPredictor(JointPredictor):
+                def predict(self,point_coords,point_labels,box,**kwargs):
+                    np.testing.assert_equal(point_labels,[1,0])
+                    assert box is None
+                    raw=np.full(self.shape,-5.0);raw[11:18,2:10]=5
+                    return np.array([raw]),np.array([.95]),None
+            second_points=dict(project_sha256=digest(root/'round2'/'project.json'),interaction_mode='single-target',
+                instances=[dict(id=anchor,points=[[5,14],[5,5]],point_labels=[1,0])])
+            (root/'second_points.json').write_text(json.dumps(second_points))
+            second=infer(root/'round2',root/'second_points.json',args.checkpoint,root/'second_proposals',predictor=SecondPredictor())
+            second_ids=second['proposals'][0]['child_ids']
+            self.assertGreater(min(second_ids),max(p['child_ids']))
+            (root/'second_approve.json').write_text(json.dumps(dict(proposals_sha256=digest(root/'second_proposals'/'proposals.json'),accepted_ids=[anchor])))
+            second_result=apply(root/'second_proposals',root/'second_approve.json',root/'second_result')
+            self.assertEqual(second_result['interaction_round'],2)
+            with rasterio.open(root/'second_result'/'region_result.tif') as src:after_second=src.read(1)
+            np.testing.assert_equal(after_second[np.isin(after,p['child_ids'])],after[np.isin(after,p['child_ids'])])
+            self.assertEqual(after_second[14,5],second_ids[0])
+            final=fusion_scores(root/'region',args.gt,root/'second_final',root/'second_result')
+            self.assertEqual(final['interaction_round'],2)
+            self.assertIn('previous_interactive',final['evaluation'])
+            (root/'empty_approve.json').write_text(json.dumps(dict(proposals_sha256=digest(root/'second_proposals'/'proposals.json'),accepted_ids=[])))
+            with self.assertRaisesRegex(ValueError,'No candidate accepted'):
+                apply(root/'second_proposals',root/'empty_approve.json',root/'empty_result')
+            self.assertFalse((root/'empty_result').exists())
+            with self.assertRaisesRegex(ValueError,'original fusion method'):
+                start(root/'region',root/'scores','intersection','wrong baseline',root/'wrong_baseline',from_result=root/'result')
             points['instances'][0]['point_labels']=[0,0,0]
             (root/'invalid.json').write_text(json.dumps(points))
             with self.assertRaisesRegex(ValueError,'at least one positive'):

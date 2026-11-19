@@ -97,3 +97,30 @@ python -m experiments.region_workflow score --experiment-dir outputs/region_case
 ```
 
 最终比较同一区域union与interactive指标，单点失败与正负点尝试分别记录。先前的单点项目JSON不能恢复到新项目（项目哈希不同），新项目第一次需重新点选。
+
+## 累计修正：在已接受的结果上提取下一条田块
+
+不要每轮都从union重新开始。`start --from-result`读取上一轮已确认的region_result.tif，并保留原始融合对照、评分ROI和GT约束。新实例ID从当前结果的最大ID继续分配；其他已有ID（包括之前拆出的田块）受保护。每轮只编辑所选目标ID的剩余部分及预测背景。支持在其他ID内部放负点排除它，但不允许以正点修改受保护ID；如确实要修正另一个ID，显式指定它作为target-id。
+
+以下从已确认并导出的outputs/region_case2_posneg_result2继续，提取目标ID 2中剩余的下一条田块：
+
+```bash
+python -m experiments.region_workflow start --experiment-dir outputs/region_case2 --fusion-scores outputs/region_case2_fusion_eval --fusion union --from-result outputs/region_case2_posneg_result2 --target-id 2 --interaction-mode single-target --reason "Continue accepted result; extract next remaining parcel" --output-dir outputs/region_case2_round2
+```
+
+打开outputs/region_case2_round2/index.html。在下一条未分出的目标田块内部放正点，在不希望包含的邻近田块内放负点。不要重复提取上一轮已分出的田块。上一轮项目点文件不能导入新项目，避免混用坐标意图或项目哈希。导出region_points.json放入本轮项目目录，然后运行：
+
+```bash
+python -m experiments.region_workflow infer --project-dir outputs/region_case2_round2 --points outputs/region_case2_round2/region_points.json --checkpoint "$HOME/xy/sam/segment-anything/sam_vit_b_01ec64.pth" --output-dir outputs/region_case2_round2_proposals
+```
+
+检查review.html，候选合理才勾选，导出确认JSON放入本轮候选目录。程序会拒绝空accepted_ids，避免把未修改结果误当作交互结果。
+
+```bash
+python -m experiments.region_workflow apply --proposals-dir outputs/region_case2_round2_proposals --approvals outputs/region_case2_round2_proposals/split_approvals.json --output-dir outputs/region_case2_round2_result
+python -m experiments.region_workflow score --experiment-dir outputs/region_case2 --gt "$HOME/xy/data/qgis_label_result3/instance.tif" --result-dir outputs/region_case2_round2_result --output-dir outputs/region_case2_round2_eval
+```
+
+本轮评分包含union（融合起点）、previous_interactive（上一轮累计结果）、interactive（本轮累计结果）。同时报告相对union的累计变化与相对上一轮的变化，不保证每轮都提升。changed_pixels仅表示本轮相对上一轮的改动像素；interaction_round和previous_result记录链路，prompt_points记录本轮输入点数。历史报告缺少点数时不要推算总点击成本，需结合各轮原始点JSON及失败重试另行汇总。
+
+再下一条使用新的目录名，并将from-result改为outputs/region_case2_round2_result，依次累计；保持目标为剩余父实例ID 2，除非页面显示目标已经不再存在。不能以结果变好为理由删除失败记录，也不能为提高分数而按GT描边。

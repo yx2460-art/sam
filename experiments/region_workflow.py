@@ -118,6 +118,9 @@ def fusion_scores(experiment,gt_path,output,result_dir=None):
         start=sealed(Path(interaction['interaction_project'])/'workflow.json')
         parent_score=sealed(Path(start['fusion_scores'])/'scores.json')
         if parent_score['gt_sha256']!=digest(gt_path): raise ValueError('GT differs from the first fusion evaluation')
+        if start.get('previous_result'):
+            previous=Path(start['previous_result']);sealed(previous/'region_result.json')
+            paths['previous_interactive']=str(previous/'region_result.tif')
         paths['interactive']=str(result_dir/'region_result.tif')
     x0,y0,x1,y1=m['context_xyxy'];win=Window(x0,y0,x1-x0,y1-y0)
     with rasterio.open(m['image']) as image,rasterio.open(gt_path) as gt,rasterio.open(m['mask']) as roi,\
@@ -140,6 +143,7 @@ def fusion_scores(experiment,gt_path,output,result_dir=None):
     score=dict(status='complete',experiment_sha256=digest(experiment/'experiment.json'),gt_sha256=digest(gt_path),
         evaluation=entries,region_xyxy=m['region_xyxy'],scoring_pixels=m['scoring_pixels'],
         interactive_start=None if not interaction else interaction['start_method'],
+        interaction_round=None if not interaction else interaction.get('interaction_round',1),
         warning='Same fixed regional ROI; GT used for development evaluation; independence unverified',
         input_sha256={str(experiment/'experiment.json'):digest(experiment/'experiment.json'),**{str(p):digest(p) for p in paths.values()}})
     write_json(output/'scores.json',score)
@@ -152,7 +156,7 @@ def fusion_scores(experiment,gt_path,output,result_dir=None):
     return score
 
 
-def start(experiment,score_dir,method,reason,output,target_id=None,interaction_mode='separate-parcels'):
+def start(experiment,score_dir,method,reason,output,target_id=None,interaction_mode='separate-parcels',from_result=None):
     if interaction_mode not in ('separate-parcels','single-target'): raise ValueError('Unknown interaction mode')
     experiment,m=load(experiment);score_dir=Path(score_dir).resolve();output=Path(output).resolve()
     if output.exists(): raise FileExistsError('Use a new interaction directory')
@@ -160,7 +164,17 @@ def start(experiment,score_dir,method,reason,output,target_id=None,interaction_m
     if first['experiment_sha256']!=digest(experiment/'experiment.json') or 'interactive' in first['evaluation']:
         raise ValueError('Use the first fusion evaluation for this fixed region')
     if method not in ('union','intersection','center','original') or not reason.strip(): raise ValueError('Specify starting fusion and reason')
-    with rasterio.open(m['image']) as image,rasterio.open(m['candidates'][method]) as src,rasterio.open(m['mask']) as roi:
+    source_path=Path(m['candidates'][method]);previous=None;round_number=1;extra_inputs=[]
+    if from_result is not None:
+        previous=Path(from_result).resolve();prior=sealed(previous/'region_result.json')
+        if prior['experiment_sha256']!=digest(experiment/'experiment.json'): raise ValueError('Previous result belongs to another region')
+        if prior['start_method']!=method: raise ValueError('Keep the original fusion method when continuing a result')
+        prior_workflow=sealed(Path(prior['interaction_project'])/'workflow.json')
+        if Path(prior_workflow['fusion_scores']).resolve()!=score_dir: raise ValueError('Keep the same first fusion evaluation')
+        source_path=previous/'region_result.tif';round_number=prior.get('interaction_round',1)+1
+        extra_inputs=[previous/'region_result.json']
+    with rasterio.open(m['image']) as image,rasterio.open(source_path) as src,rasterio.open(m['mask']) as roi:
+        aligned(image,src,False)
         data=src.read(1);mask=roi.read(1)>0;rgb=rgb_read(image,Window(0,0,image.width,image.height),[1,2,3],None)
         ids,counts=np.unique(data[mask],return_counts=True);positive=ids>0
         anchor=int(ids[positive][np.argmax(counts[positive])]) if positive.any() else 0
@@ -172,11 +186,11 @@ def start(experiment,score_dir,method,reason,output,target_id=None,interaction_m
         for line in data:
             starts=np.r_[0,np.flatnonzero(line[1:]!=line[:-1])+1];ownership.append([[int(x),int(line[x])] for x in starts])
         output.mkdir(parents=True);save_png(output/f'{anchor}_target.png',overlay(rgb,data,mask))
-        project=dict(status='ready',image=m['image'],instances=m['candidates'][method],
-            regions=[dict(id=anchor,xyxy=[0,0,image.width,image.height])],max_source_id=m['global_max_id'],
+        project=dict(status='ready',image=m['image'],instances=str(source_path),
+            regions=[dict(id=anchor,xyxy=[0,0,image.width,image.height])],max_source_id=max(m['global_max_id'],int(data.max())),
             global_xy_offset=m['context_xyxy'][:2],
             rgb_bands=[1,2,3],rgb_range=None,allow_crs_mismatch=False,
-            input_sha256={str(p):digest(p) for p in (m['image'],m['candidates'][method],m['mask'])},
+            input_sha256={str(p):digest(p) for p in (m['image'],source_path,m['mask'],*extra_inputs)},
             protocol='Fixed-region post-fusion positive interaction; protected existing IDs; point-only')
         write_json(output/'project.json',project)
         # This page annotates the fixed region; the scoring mask is checked again before inference.
@@ -193,6 +207,8 @@ def start(experiment,score_dir,method,reason,output,target_id=None,interaction_m
             page+='<p>本页只提取一个田块。正点（红色）放在目标内部，负点（蓝色）放在被误包含的邻近田块。所有点共同输入SAM，最多8点，至少一个正点。不重新求并，不看GT。仅亮区可标点，其他已有ID允许负点但不会被覆盖。</p>'
             page+='<label>点击类型：<select id="polarity"><option value="1">正点：保留目标</option><option value="0">负点：排除邻块</option></select></label><p>补点重试：恢复本项目上一次导出的JSON，补点后再次导出；infer使用新的输出目录。</p><input type="file" accept=".json" onchange="restore(this)">'
         page+=f'<canvas id="canvas" width="{image.width}" height="{image.height}" style="max-width:96vw;height:auto"></canvas><p id="status"></p><button onclick="undo()">撤销</button><button onclick="download()">导出 region_points.json</button>'
+        if previous:
+            page+=f'<p>累计交互第{round_number}轮：从已确认结果 {html.escape(str(previous))} 继续。本轮仍修改目标ID {anchor} 的剩余部分，先前提取的新实例受保护。请选下一条尚未提取的田块。</p>'
     script=r'''
 const c=CONFIG,points=[],labels=[],canvas=document.getElementById('canvas'),ctx=canvas.getContext('2d'),img=new Image(),began=Date.now();
 function draw(){ctx.drawImage(img,0,0);points.forEach((p,i)=>{ctx.beginPath();ctx.arc(p[0],p[1],6,0,Math.PI*2);ctx.fillStyle=labels[i]===0?'#0088ff':'red';ctx.fill();ctx.font='22px sans-serif';ctx.fillStyle='white';ctx.fillText((labels[i]===0?'-':'+')+(i+1),p[0]+8,p[1]);});
@@ -216,7 +232,8 @@ const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.st
     (output/'index.html').write_text(page+'<script>'+script+'</script>',encoding='utf-8')
     workflow=dict(status='ready',experiment=str(experiment),experiment_sha256=digest(experiment/'experiment.json'),
         fusion_scores=str(score_dir),start_method=method,reason=reason,target_id=anchor,interaction_mode=interaction_mode,mask=m['mask'],
-        input_sha256={str(p):digest(p) for p in (experiment/'experiment.json',score_dir/'scores.json',output/'project.json')})
+        previous_result=None if previous is None else str(previous),interaction_round=round_number,
+        input_sha256={str(p):digest(p) for p in (experiment/'experiment.json',score_dir/'scores.json',output/'project.json',*extra_inputs)})
     write_json(output/'workflow.json',workflow);print(f'Open {output}/index.html; start={method}; no GT read')
     return workflow
 
@@ -240,8 +257,10 @@ def apply(proposals,approvals,output):
     if output.exists(): raise FileExistsError('Use a new result directory')
     p=sealed(proposals/'proposals.json');project=Path(p['project']);w=sealed(project/'workflow.json')
     experiment,m=load(w['experiment'])
+    if not read(approvals).get('accepted_ids'): raise ValueError('No candidate accepted: tick the review checkbox and export approvals again')
+    project_manifest=sealed(project/'project.json')
     split_apply(proposals,approvals,output/'unclipped_candidate')
-    with rasterio.open(m['candidates'][w['start_method']]) as src,rasterio.open(m['mask']) as roi,\
+    with rasterio.open(project_manifest['instances']) as src,rasterio.open(m['mask']) as roi,\
          rasterio.open(output/'unclipped_candidate'/'instance.tif') as candidate:
         before=src.read(1);data=before.copy();mask=roi.read(1)>0;edited=candidate.read(1);data[mask]=edited[mask]
         save_labels(output/'region_result.tif',data,src.profile)
@@ -249,6 +268,8 @@ def apply(proposals,approvals,output):
     report=dict(status='complete',experiment_sha256=digest(experiment/'experiment.json'),interaction_project=str(project),
         start_method=w['start_method'],reason=w['reason'],ground_truth_used_for_edits=False,
         changed_pixels=int((data!=before).sum()),scoring_pixels=int(mask.sum()),
+        previous_result=w.get('previous_result'),interaction_round=w.get('interaction_round',1),
+        prompt_points=sum(len(entry['points']) for entry in p['proposals']),
         scope='Region-context crop export; only fixed region mask modified; not a whole-image export',
         input_sha256={str(path):digest(path) for path in (project/'workflow.json',output/'region_result.tif',
             output/'unclipped_candidate'/'split_result.json')})
@@ -264,6 +285,7 @@ def main():
     p.add_argument('--output-dir',type=Path,required=True);p.add_argument('--result-dir',type=Path)
     p=sub.add_parser('start');p.add_argument('--experiment-dir',type=Path,required=True);p.add_argument('--fusion-scores',type=Path,required=True)
     p.add_argument('--target-id',type=int,help='Explicit existing ID to refine; other existing IDs remain protected')
+    p.add_argument('--from-result',type=Path,help='Continue an approved regional result; preserve prior edits and allocate fresh IDs')
     p.add_argument('--interaction-mode',choices=['separate-parcels','single-target'],default='separate-parcels',help='single-target jointly prompts one parcel using positive and negative points')
     p.add_argument('--fusion',choices=['union','intersection','center','original'],required=True);p.add_argument('--reason',required=True);p.add_argument('--output-dir',type=Path,required=True)
     p=sub.add_parser('infer');p.add_argument('--project-dir',type=Path,required=True);p.add_argument('--points',type=Path,required=True)
@@ -272,7 +294,7 @@ def main():
     a=parser.parse_args()
     if a.command=='prepare': prepare(a.run_dir,a.output_dir,a.instance_id,a.bounds,a.padding,a.context)
     elif a.command=='score': fusion_scores(a.experiment_dir,a.gt,a.output_dir,a.result_dir)
-    elif a.command=='start': start(a.experiment_dir,a.fusion_scores,a.fusion,a.reason,a.output_dir,a.target_id,a.interaction_mode)
+    elif a.command=='start': start(a.experiment_dir,a.fusion_scores,a.fusion,a.reason,a.output_dir,a.target_id,a.interaction_mode,a.from_result)
     elif a.command=='infer': infer(a.project_dir,a.points,a.checkpoint,a.output_dir,a.device)
     else: apply(a.proposals_dir,a.approvals,a.output_dir)
 
