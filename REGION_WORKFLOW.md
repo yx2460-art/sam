@@ -173,3 +173,19 @@ python -m experiments.diagnose_region --experiment-dir outputs/region_case2 --re
 检查新实例是否匹配GT、未匹配边界是否集中在新实例两侧／两端、父实例剩余像素是否留下细带或碎片。将第三轮右侧边界图、本轮改动图和summary.txt一起查看后，再决定补点修正或继续提取下一条，不预先认定一定是旋转插值或模型错误。
 
 诊断输出的scores/summary.txt应与第三轮原评分一致；边界计数在运行时逐项与评分核验。所有图均映射到原网格，输出不更改已确认实例。GT叠加页只用于开发诊断，不是交互提示页面；看过GT后的后续调整不能称为独立盲测，不应按GT边界逐像素描绘提示。
+
+## 第三轮受控对照：保持上一轮前景范围，只重新分配实例ID
+
+第三轮斜框结果新增了2707个真前景像素和5656个假前景像素。为隔离前景扩张的影响，复用**同一份第三轮SAM候选、相同确认文件和相同第二轮起点**，不重新标点、不重跑SAM。apply新增显式选项`--preserve-foreground`：只在上一轮已为前景的像素内重新分配实例ID，背景保持背景、父实例剩余像素与其他已有实例保持原有保护。不读取GT，不区别挑选正确或错误扩张，因此2707个正确补充与5656个错误补充都会被抑制。
+
+```bash
+python -m experiments.region_workflow apply --proposals-dir outputs/region_case2_round3_box_proposals1 --approvals outputs/region_case2_round3_box_proposals1/split_approvals.json --preserve-foreground --output-dir outputs/region_case2_round3_box_fgcontrol_result1
+python -m experiments.region_workflow score --experiment-dir outputs/region_case2 --gt "$HOME/xy/data/qgis_label_result3/instance.tif" --result-dir outputs/region_case2_round3_box_fgcontrol_result1 --output-dir outputs/region_case2_round3_box_fgcontrol_eval1
+python -m experiments.diagnose_region --experiment-dir outputs/region_case2 --result-dir outputs/region_case2_round3_box_fgcontrol_result1 --gt "$HOME/xy/data/qgis_label_result3/instance.tif" --output-dir outputs/region_case2_round3_box_fgcontrol_diagnosis1
+```
+
+保留原第三轮结果，不覆盖。报告write_policy明确区分parent-and-background（原流程）与preserve-foreground（本对照）；suppressed_added_foreground_pixels只统计固定评分域内抑制的扩张数量，added/removed_foreground_pixels都应为0。unclipped_candidate仍保存原始接受候选供审计，不能作为控制组最终结果；使用主目录region_result.tif。
+
+预期是本对照IoU、前景precision/recall/Dice与**第二轮起点**严格一致，而不是保证回到最初求并值；程序在回写时校验前景二值范围完全不变。实例F1、PQ和边界F1可能改变，需实测。背景限制也可能使新实例不连通或残留细带，此对照不额外填洞或造边界，不保证一定改善。
+
+对照三组：第二轮结果、原第三轮斜框结果、本次前景保持对照。比较同一GT和容差下的实例F1/PQ、边界F1与误差图。本次summary.txt会列出新实例的最佳GT重叠及实际匹配；新实例351是否匹配应以CSV/diagnostics.json为准，不能仅凭黄色ID变更面积推断。看过GT后设计的本对照属于开发分析，后续独立区域还需另行验证。

@@ -16,6 +16,51 @@ from experiments.region_workflow import prepare,fusion_scores,start,infer,apply
 
 
 class RegionWorkflowTests(unittest.TestCase):
+    def test_same_candidates_can_be_applied_with_foreground_preserving_control(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);args=test_conflict_regions.RegionTests().fixture(root)
+            with rasterio.open(root/'prediction.tif') as src:source=src.read(1);profile=src.profile
+            source[8:12,8:12]=0;source[16:20,16:20]=2
+            with rasterio.open(root/'source_holes.tif','w',**profile) as dst:dst.write(source,1)
+            params=json.loads((root/'tiles'/'manifest.json').read_text())['parameters']
+            params.update(prediction=str(root/'source_holes.tif'),output_dir=root/'holes_tiles')
+            run_tiles(SimpleNamespace(**params),refine=lambda rgb,original,predictor,options:(original.copy(),[]))
+            m=prepare(root/'holes_tiles',root/'region',bounds=[4,4,16,16],context=2)
+            first=fusion_scores(root/'region',args.gt,root/'scores')
+            start(root/'region',root/'scores','union','control',root/'interaction',target_id=1,interaction_mode='single-target')
+            points=dict(project_sha256=digest(root/'interaction'/'project.json'),interaction_mode='single-target',
+                instances=[dict(id=1,points=[[5,5]],point_labels=[1])])
+            (root/'points.json').write_text(json.dumps(points))
+            proposals=infer(root/'interaction',root/'points.json',args.checkpoint,root/'proposals',predictor=test_split_instances.Predictor(True))
+            proposal_hash=digest(root/'proposals'/'proposals.json')
+            (root/'approve.json').write_text(json.dumps(dict(proposals_sha256=proposal_hash,accepted_ids=[1])))
+            normal=apply(root/'proposals',root/'approve.json',root/'normal')
+            actual=rasterio.open
+            def no_gt(path,*a,**kw):
+                self.assertNotEqual(Path(path).resolve(),args.gt.resolve())
+                return actual(path,*a,**kw)
+            with patch('rasterio.open',side_effect=no_gt):
+                control=apply(root/'proposals',root/'approve.json',root/'control',preserve_foreground=True)
+            self.assertEqual(normal['added_foreground_pixels'],16)
+            self.assertEqual(control['suppressed_added_foreground_pixels'],16)
+            self.assertEqual(control['added_foreground_pixels'],0);self.assertEqual(control['removed_foreground_pixels'],0)
+            self.assertGreater(control['changed_pixels'],0)
+            self.assertEqual(proposal_hash,digest(root/'proposals'/'proposals.json'))
+            with actual(m['candidates']['union']) as src:before=src.read(1)
+            with actual(m['mask']) as src:mask=src.read(1)>0
+            with actual(root/'control'/'region_result.tif') as src:after=src.read(1)
+            np.testing.assert_equal(before>0,after>0)
+            np.testing.assert_equal(before[~mask],after[~mask])
+            np.testing.assert_equal(before[before==2],after[before==2])
+            final=fusion_scores(root/'region',args.gt,root/'control_eval',root/'control')
+            self.assertEqual(final['write_policy'],'preserve-foreground')
+            for metric in ('mask_iou','mask_precision','mask_recall','mask_dice'):
+                self.assertEqual(final['evaluation']['interactive'][metric],first['evaluation']['union'][metric])
+            from experiments.diagnose_region import diagnose
+            diagnosis=diagnose(root/'region',root/'control',args.gt,root/'diagnose_control')
+            self.assertEqual(diagnosis['last_round_changes']['wrong_added_foreground'],0)
+            self.assertEqual(diagnosis['last_round_changes']['correct_added_foreground'],0)
+
     def test_oriented_box_inference_exports_original_grid_and_same_roi(self):
         class BoxPredictor:
             model=SimpleNamespace(mask_threshold=0)
@@ -211,6 +256,9 @@ class RegionWorkflowTests(unittest.TestCase):
             self.assertTrue(np.any(data[mask]>0));self.assertTrue(np.all(data[~mask]==0))
             final=fusion_scores(root/'region',args.gt,root/'final',root/'result')
             self.assertGreater(final['evaluation']['interactive']['mask_iou'],final['evaluation']['intersection']['mask_iou'])
+            control=apply(root/'proposals',root/'approval.json',root/'control',preserve_foreground=True)
+            self.assertEqual(control['changed_pixels'],0)
+            self.assertGreater(control['suppressed_added_foreground_pixels'],0)
 
 
 if __name__=='__main__': unittest.main()

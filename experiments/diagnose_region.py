@@ -107,18 +107,22 @@ def diagnose(experiment,result,gt_path,output):
     save_png(output/'last_round_changes.png',paint(rgb,codes,mask,{1:[20,220,80],2:[255,40,40],3:[40,140,255],4:[220,80,220],5:[255,220,0]}))
     new_ids=sorted(set(np.unique(arrays['interactive'][mask]).tolist())-set(np.unique(arrays[previous_name][mask]).tolist())-{0})
     report=dict(status='complete',warning='GT-visible development diagnosis; not a blind test and not an editing/prompt page',
+        write_policy=r.get('write_policy','parent-and-background'),
         evaluation=score['evaluation'],boundary_tolerance=m['boundary_tolerance'],scoring_pixels=m['scoring_pixels'],
         context_xyxy=m['context_xyxy'],last_round_reference=previous_name,new_pred_ids=new_ids,
         last_round_changes=change_counts,diagnostics=details,
         input_sha256={str(p):digest(p) for p in [experiment/'experiment.json',result/'region_result.json',gt_path,*paths.values()]})
     write_json(output/'diagnostics.json',report)
-    lines=['GT-visible diagnosis only; no predictions changed.',f'Scoring pixels={m["scoring_pixels"]}; tolerance={m["boundary_tolerance"]} pixels']
+    lines=['GT-visible diagnosis only; no predictions changed.',f'Write policy: {report["write_policy"]}',f'Scoring pixels={m["scoring_pixels"]}; tolerance={m["boundary_tolerance"]} pixels']
     for name,entry in details.items():lines.append(f'{name}: {entry["boundary_counts"]}')
     lines.extend([f'New instance IDs relative to {previous_name}: {new_ids}',f'Last-round changes: {change_counts}'])
+    for row in details['interactive']['instances']:
+        if row['pred_id'] in new_ids: lines.append(f'New instance match: {row}')
     (output/'summary.txt').write_text('\n'.join(lines)+'\n',encoding='utf-8')
     (output/'index.html').write_text('<!doctype html><meta charset="utf-8"><title>区域交互后边界诊断</title>'
         '<style>body{font-family:sans-serif;margin:20px}.pair{display:flex;gap:1%}.pair img{width:49%;object-fit:contain}img{max-width:100%}p{line-height:1.6}</style>'
         '<h1>固定区域：边界与实例匹配诊断</h1><p>本页显示GT，仅供事后开发诊断，不生成提示，不自动修边，不替代原有评分。之后修改属于看过GT后的开发实验。'
+        f'本次回写策略：{html.escape(report["write_policy"])}。'
         f'固定评分像素 {m["scoring_pixels"]}；边界容差 {m["boundary_tolerance"]} 像素，评分域向内收缩容差＋1，忽略人为ROI边缘。图片可在新标签页放大查看。</p>'
         '<p><a href="scores/summary.txt">相同设置的完整评分</a>；<a href="diagnostics.json">诊断数据</a></p>'
         +''.join(cards)+'<h2>本轮相对上一结果的改动</h2><p>绿：正确补前景；红：错误补前景；蓝：错误删前景；紫：正确删前景；黄：前景内ID改变（不等同于正确拆分）。</p>'

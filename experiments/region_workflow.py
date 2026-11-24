@@ -144,6 +144,7 @@ def fusion_scores(experiment,gt_path,output,result_dir=None):
         evaluation=entries,region_xyxy=m['region_xyxy'],scoring_pixels=m['scoring_pixels'],
         interactive_start=None if not interaction else interaction['start_method'],
         interaction_round=None if not interaction else interaction.get('interaction_round',1),
+        write_policy=None if not interaction else interaction.get('write_policy','parent-and-background'),
         warning='Same fixed regional ROI; GT used for development evaluation; independence unverified',
         input_sha256={str(experiment/'experiment.json'):digest(experiment/'experiment.json'),**{str(p):digest(p) for p in paths.values()}})
     write_json(output/'scores.json',score)
@@ -151,6 +152,7 @@ def fusion_scores(experiment,gt_path,output,result_dir=None):
     with (output/'comparison.csv').open('w',newline='',encoding='utf-8-sig') as stream:
         writer=csv.DictWriter(stream,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
     lines=[score['warning'],f"Scoring pixels={m['scoring_pixels']}; region={m['region_xyxy']}"]
+    if interaction: lines.append(f"Interactive write policy: {score['write_policy']}")
     for row in rows: lines.append(f"{row['method']}: IoU={row['mask_iou']:.6f}, boundary_F1={row['boundary_f1']:.6f}, instance_F1={row['instance_f1']:.6f}, PQ={row['pq']:.6f}")
     (output/'summary.txt').write_text('\n'.join(lines)+'\n',encoding='utf-8');print('\n'.join(lines))
     return score
@@ -271,7 +273,7 @@ def infer(project,points,checkpoint,output,device='cuda:0',predictor=None):
     return split_infer(project,points,checkpoint,output,device=device,predictor=predictor,prompt_mode='point-only')
 
 
-def apply(proposals,approvals,output):
+def apply(proposals,approvals,output,preserve_foreground=False):
     proposals,output=Path(proposals).resolve(),Path(output).resolve()
     if output.exists(): raise FileExistsError('Use a new result directory')
     p=sealed(proposals/'proposals.json');project=Path(p['project']);w=sealed(project/'workflow.json')
@@ -281,19 +283,28 @@ def apply(proposals,approvals,output):
     split_apply(proposals,approvals,output/'unclipped_candidate')
     with rasterio.open(project_manifest['instances']) as src,rasterio.open(m['mask']) as roi,\
          rasterio.open(output/'unclipped_candidate'/'instance.tif') as candidate:
-        before=src.read(1);data=before.copy();mask=roi.read(1)>0;edited=candidate.read(1);data[mask]=edited[mask]
+        before=src.read(1);data=before.copy();mask=roi.read(1)>0;edited=candidate.read(1)
+        suppressed=mask&(before==0)&(edited>0) if preserve_foreground else np.zeros_like(mask)
+        write_mask=mask&(before>0) if preserve_foreground else mask
+        data[write_mask]=edited[write_mask]
+        if preserve_foreground and np.any((data>0)!=(before>0)): raise ValueError('Foreground-preserving control changed the foreground footprint')
         save_labels(output/'region_result.tif',data,src.profile)
         save_mask(output/'changed_pixels.tif',data!=before,src.profile)
     report=dict(status='complete',experiment_sha256=digest(experiment/'experiment.json'),interaction_project=str(project),
         start_method=w['start_method'],reason=w['reason'],ground_truth_used_for_edits=False,
         changed_pixels=int((data!=before).sum()),scoring_pixels=int(mask.sum()),
+        write_policy='preserve-foreground' if preserve_foreground else 'parent-and-background',
+        suppressed_added_foreground_pixels=int(suppressed.sum()),
+        added_foreground_pixels=int((mask&(before==0)&(data>0)).sum()),
+        removed_foreground_pixels=int((mask&(before>0)&(data==0)).sum()),
         previous_result=w.get('previous_result'),interaction_round=w.get('interaction_round',1),
         prompt_points=sum(len(entry['points']) for entry in p['proposals']),
         box_clicks=3*sum('oriented_box' in entry for entry in p['proposals']),
         scope='Region-context crop export; only fixed region mask modified; not a whole-image export',
         input_sha256={str(path):digest(path) for path in (project/'workflow.json',output/'region_result.tif',
             output/'unclipped_candidate'/'split_result.json')})
-    write_json(output/'region_result.json',report);print(f'Exported {output}/region_result.tif; fixed write region only')
+    write_json(output/'region_result.json',report);print(f'Exported {output}/region_result.tif; fixed write region only; policy={report["write_policy"]}; suppressed additions={report["suppressed_added_foreground_pixels"]}')
+    if not report['changed_pixels']: print('No pixels changed in the final scoring/write region; this control made no effective edit.')
     return report
 
 
@@ -311,12 +322,13 @@ def main():
     p=sub.add_parser('infer');p.add_argument('--project-dir',type=Path,required=True);p.add_argument('--points',type=Path,required=True)
     p.add_argument('--checkpoint',type=Path,required=True);p.add_argument('--output-dir',type=Path,required=True);p.add_argument('--device',default='cuda:0')
     p=sub.add_parser('apply');p.add_argument('--proposals-dir',type=Path,required=True);p.add_argument('--approvals',type=Path,required=True);p.add_argument('--output-dir',type=Path,required=True)
+    p.add_argument('--preserve-foreground',action='store_true',help='Control: relabel existing foreground only, suppress all background additions; no GT used')
     a=parser.parse_args()
     if a.command=='prepare': prepare(a.run_dir,a.output_dir,a.instance_id,a.bounds,a.padding,a.context)
     elif a.command=='score': fusion_scores(a.experiment_dir,a.gt,a.output_dir,a.result_dir)
     elif a.command=='start': start(a.experiment_dir,a.fusion_scores,a.fusion,a.reason,a.output_dir,a.target_id,a.interaction_mode,a.from_result)
     elif a.command=='infer': infer(a.project_dir,a.points,a.checkpoint,a.output_dir,a.device)
-    else: apply(a.proposals_dir,a.approvals,a.output_dir)
+    else: apply(a.proposals_dir,a.approvals,a.output_dir,a.preserve_foreground)
 
 
 if __name__=='__main__': main()
