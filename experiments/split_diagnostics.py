@@ -64,10 +64,15 @@ def write_report(output,proposals,min_area,min_score):
         for seed in proposal['detail'].get('diagnostics',[]):
             status=STATUSES.get(seed['status'],seed['status'])
             cards.append(f'<h3>点{seed["seed"]+1}：{html.escape(status)}</h3>')
+            if seed.get('oriented_box'):
+                audit=seed['oriented_box']
+                cards.append(f'<p>已使用斜矩形提示：SAM旋转图内水平框 {audit["sam_box_xyxy"]}。下图掩膜及点坐标均已还原到原图，未按框裁切。</p>')
             cards.append(f'<p>局部坐标{seed["point"]}，原图坐标({x0+seed["point"][0]}, {y0+seed["point"][1]})。'
                          f'提示框：{html.escape(str(seed["box"]))}。红点编号对应原标注。</p>')
             if not seed['candidates']: cards.append('<p>无SAM候选：该点已有其他实例ID，未进行推理。</p>')
             for candidate in seed['candidates']:
+                if 'raw_contains_negative_points' in candidate:
+                    cards.append(f'<p>本组原始候选覆盖的负点编号：{candidate["raw_contains_negative_points"]}（应为空）；所有正负点共同传入SAM。</p>')
                 reasons=[REASONS.get(code,code) for code in candidate['rejection_codes']]
                 decision='；'.join(reasons) or ('通过，质量分数最高，进入重叠处理' if candidate['selected'] else '通过，但质量分数不是最高，未选用')
                 score='非有限值' if candidate['score'] is None else f'{candidate["score"]:.6f}'

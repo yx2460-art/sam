@@ -206,14 +206,28 @@ def start(experiment,score_dir,method,reason,output,target_id=None,interaction_m
             page=f'<!doctype html><meta charset="utf-8"><h1>SAM 单田块正负点交互</h1><p>起点：{method}；目标ID：{anchor}；原因：{html.escape(reason)}。</p>'
             page+='<p>本页只提取一个田块。正点（红色）放在目标内部，负点（蓝色）放在被误包含的邻近田块。所有点共同输入SAM，最多8点，至少一个正点。不重新求并，不看GT。仅亮区可标点，其他已有ID允许负点但不会被覆盖。</p>'
             page+='<label>点击类型：<select id="polarity"><option value="1">正点：保留目标</option><option value="0">负点：排除邻块</option></select></label><p>补点重试：恢复本项目上一次导出的JSON，补点后再次导出；infer使用新的输出目录。</p><input type="file" accept=".json" onchange="restore(this)">'
+            page+='<p>可选斜矩形提示：切换“画斜框”，沿目标长边先点起点、再点终点，第三次点击另一侧确定宽度。青色矩形可任意倾斜，留少量余量包住整条目标，不必精确描边。再切回“标正负点”。</p><label>操作：<select id="tool"><option value="point">标正负点</option><option value="box">画斜框（3次点击）</option></select></label><button onclick="undoBox()">撤销框点</button><button onclick="clearBox()">清除斜框</button><p id="boxStatus"></p>'
         page+=f'<canvas id="canvas" width="{image.width}" height="{image.height}" style="max-width:96vw;height:auto"></canvas><p id="status"></p><button onclick="undo()">撤销</button><button onclick="download()">导出 region_points.json</button>'
         if previous:
             page+=f'<p>累计交互第{round_number}轮：从已确认结果 {html.escape(str(previous))} 继续。本轮仍修改目标ID {anchor} 的剩余部分，先前提取的新实例受保护。请选下一条尚未提取的田块。</p>'
     script=r'''
-const c=CONFIG,points=[],labels=[],canvas=document.getElementById('canvas'),ctx=canvas.getContext('2d'),img=new Image(),began=Date.now();
-function draw(){ctx.drawImage(img,0,0);points.forEach((p,i)=>{ctx.beginPath();ctx.arc(p[0],p[1],6,0,Math.PI*2);ctx.fillStyle=labels[i]===0?'#0088ff':'red';ctx.fill();ctx.font='22px sans-serif';ctx.fillStyle='white';ctx.fillText((labels[i]===0?'-':'+')+(i+1),p[0]+8,p[1]);});
+const c=CONFIG,points=[],labels=[],boxPoints=[],canvas=document.getElementById('canvas'),ctx=canvas.getContext('2d'),img=new Image(),began=Date.now();
+function boxGeometry(bp){if(bp.length!==3||bp.some(p=>!Array.isArray(p)||p.length!==2||!p.every(Number.isFinite)))throw Error('斜框需要3个有效点');
+const [a,b,p]=bp,dx=b[0]-a[0],dy=b[1]-a[1],len=Math.hypot(dx,dy);if(len<2)throw Error('长边太短');
+const u=[dx/len,dy/len],v=[-u[1],u[0]],d=(p[0]-a[0])*v[0]+(p[1]-a[1])*v[1];if(Math.abs(d)<2)throw Error('斜框太窄');
+const corners=[a,b,[b[0]+d*v[0],b[1]+d*v[1]],[a[0]+d*v[0],a[1]+d*v[1]]];
+if(corners.some(p=>p[0]<0||p[1]<0||p[0]>canvas.width-1||p[1]>canvas.height-1))throw Error('斜框顶点超出影像，请重画');return {corners,a,u,v,len,d};}
+function draw(){ctx.drawImage(img,0,0);
+if(boxPoints.length){ctx.strokeStyle='cyan';ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(...boxPoints[0]);if(boxPoints.length>1)ctx.lineTo(...boxPoints[1]);
+if(boxPoints.length===3){try{const g=boxGeometry(boxPoints);g.corners.slice(2).forEach(p=>ctx.lineTo(...p));ctx.closePath();}catch(e){}}ctx.stroke();boxPoints.forEach(p=>{ctx.fillStyle='cyan';ctx.fillRect(p[0]-4,p[1]-4,8,8);});}
+const bs=document.getElementById('boxStatus');if(bs)bs.textContent='斜框点：'+boxPoints.length+'/3（0点表示不使用框）';
+points.forEach((p,i)=>{ctx.beginPath();ctx.arc(p[0],p[1],6,0,Math.PI*2);ctx.fillStyle=labels[i]===0?'#0088ff':'red';ctx.fill();ctx.font='22px sans-serif';ctx.fillStyle='white';ctx.fillText((labels[i]===0?'-':'+')+(i+1),p[0]+8,p[1]);});
 document.getElementById('status').textContent=points.map((p,i)=>{let id=0;for(const r of c.ownership[p[1]]||[]){if(r[0]>p[0])break;id=r[1];}return '点'+(i+1)+': '+(id===0?'融合结果背景':id===c.id?'当前目标ID '+id:'其他已有ID '+id+'（保护）');}).join('；');}
-img.onload=draw;img.src=c.id+'_target.png';canvas.onclick=e=>{if(points.length>=8){alert('最多8点');return;}const r=canvas.getBoundingClientRect(),x=Math.floor((e.clientX-r.left)*canvas.width/r.width),y=Math.floor((e.clientY-r.top)*canvas.height/r.height);
+img.onload=draw;img.src=c.id+'_target.png';canvas.onclick=e=>{const r=canvas.getBoundingClientRect(),x=Math.floor((e.clientX-r.left)*canvas.width/r.width),y=Math.floor((e.clientY-r.top)*canvas.height/r.height);
+if(c.mode==='single-target'&&document.getElementById('tool').value==='box'){
+if(boxPoints.length>=3){alert('斜框已完成，请切回标正负点，或清除重画');return;}boxPoints.push([x,y]);
+if(boxPoints.length===3){try{boxGeometry(boxPoints);}catch(e){boxPoints.pop();alert(e.message);}}draw();return;}
+if(points.length>=8){alert('最多8个正负点');return;}
 if(!(c.allowed[y]||[]).some(([a,b])=>x>=a&&x<b)){alert('这里是本轮固定区域以外的上下文，不会回写。请在未变暗区域点选。');return;}
 let owner=0;for(const r of c.ownership[y]||[]){if(r[0]>x)break;owner=r[1];}
 const label=c.mode==='single-target'?Number(document.getElementById('polarity').value):1;
@@ -221,12 +235,17 @@ if(label===1&&owner!==0&&owner!==c.id){alert('此处属于已有实例ID '+owner
 if(points.some(p=>p[0]===x&&p[1]===y)){alert('此坐标已标点，请撤销后重选');return;}
 points.push([x,y]);labels.push(label);draw();};
 function undo(){points.pop();labels.pop();draw();}
+function undoBox(){boxPoints.pop();draw();}function clearBox(){boxPoints.length=0;draw();}
 async function restore(input){try{const v=JSON.parse(await input.files[0].text()),r=v.instances[0];
 if(v.project_sha256!==c.hash||v.interaction_mode!=='single-target'||v.instances.length!==1||r.id!==c.id||!Array.isArray(r.points)||!Array.isArray(r.point_labels)||r.points.length!==r.point_labels.length||r.points.length>8)throw Error('请选择本项目导出的正负点JSON');
 if(r.points.some((p,i)=>!Array.isArray(p)||p.length!==2||!p.every(Number.isInteger)||![0,1].includes(r.point_labels[i])||!(c.allowed[p[1]]||[]).some(([a,b])=>p[0]>=a&&p[0]<b)))throw Error('点格式或区域不匹配');
-points.splice(0,points.length,...r.points);labels.splice(0,labels.length,...r.point_labels);draw();}catch(e){alert(e.message);}}
+if(r.oriented_box)boxGeometry(r.oriented_box);
+points.splice(0,points.length,...r.points);labels.splice(0,labels.length,...r.point_labels);boxPoints.splice(0,boxPoints.length,...(r.oriented_box||[]));draw();}catch(e){alert(e.message);}}
 function download(){if(!points.length||!labels.includes(1)){alert('至少需要一个正点');return;}const row={id:c.id,points},v={project_sha256:c.hash,instances:[row],browser_wall_seconds:(Date.now()-began)/1000};
 if(c.mode==='single-target'){v.interaction_mode=c.mode;row.point_labels=labels;}
+if(boxPoints.length){try{const g=boxGeometry(boxPoints);
+if(points.some((p,i)=>{if(labels[i]!==1)return false;const dx=p[0]-g.a[0],dy=p[1]-g.a[1],s=dx*g.u[0]+dy*g.u[1],t=dx*g.v[0]+dy*g.v[1];return s<0||s>g.len||t<Math.min(0,g.d)||t>Math.max(0,g.d);}))throw Error('正点必须在目标斜框内；负点可在框外');row.oriented_box=boxPoints;
+}catch(e){alert(e.message);return;}}
 const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(v,null,2)],{type:'application/json'}));a.download='region_points.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}
 '''.replace('CONFIG',config)
     (output/'index.html').write_text(page+'<script>'+script+'</script>',encoding='utf-8')
@@ -270,6 +289,7 @@ def apply(proposals,approvals,output):
         changed_pixels=int((data!=before).sum()),scoring_pixels=int(mask.sum()),
         previous_result=w.get('previous_result'),interaction_round=w.get('interaction_round',1),
         prompt_points=sum(len(entry['points']) for entry in p['proposals']),
+        box_clicks=3*sum('oriented_box' in entry for entry in p['proposals']),
         scope='Region-context crop export; only fixed region mask modified; not a whole-image export',
         input_sha256={str(path):digest(path) for path in (project/'workflow.json',output/'region_result.tif',
             output/'unclipped_candidate'/'split_result.json')})

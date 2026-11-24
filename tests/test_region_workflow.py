@@ -16,6 +16,39 @@ from experiments.region_workflow import prepare,fusion_scores,start,infer,apply
 
 
 class RegionWorkflowTests(unittest.TestCase):
+    def test_oriented_box_inference_exports_original_grid_and_same_roi(self):
+        class BoxPredictor:
+            model=SimpleNamespace(mask_threshold=0)
+            def set_image(self,rgb): self.shape=rgb.shape[:2]
+            def predict(self,point_coords,point_labels,box,**kwargs):
+                assert box is not None
+                np.testing.assert_equal(point_labels,[1,0])
+                yy,xx=np.indices(self.shape)
+                raw=np.where((xx>=box[0])&(xx<=box[2])&(yy>=box[1])&(yy<=box[3]),5.0,-5.0)
+                return np.array([raw]),np.array([.95]),None
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);args=test_conflict_regions.RegionTests().fixture(root)
+            prepare(root/'tiles',root/'region',bounds=[4,4,16,16],context=2)
+            first=fusion_scores(root/'region',args.gt,root/'scores')
+            start(root/'region',root/'scores','union','rotated target',root/'interaction',interaction_mode='single-target')
+            project=json.loads((root/'interaction'/'project.json').read_text());anchor=project['regions'][0]['id']
+            points=dict(project_sha256=digest(root/'interaction'/'project.json'),interaction_mode='single-target',
+                instances=[dict(id=anchor,points=[[8,7],[8,14]],point_labels=[1,0],oriented_box=[[3,3],[16,7],[2,8]])])
+            (root/'points.json').write_text(json.dumps(points))
+            proposals=infer(root/'interaction',root/'points.json',args.checkpoint,root/'proposals',predictor=BoxPredictor())
+            p=proposals['proposals'][0];self.assertEqual(p['status'],'proposal')
+            self.assertEqual(p['oriented_box']['mode'],'rotated-image-box')
+            (root/'approve.json').write_text(json.dumps(dict(proposals_sha256=digest(root/'proposals'/'proposals.json'),accepted_ids=[anchor])))
+            apply(root/'proposals',root/'approve.json',root/'result')
+            with rasterio.open(root/'region'/'union.tif') as src:before=src.read(1);transform=src.transform
+            with rasterio.open(root/'region'/'region_mask.tif') as src:mask=src.read(1)>0
+            with rasterio.open(root/'result'/'region_result.tif') as src:
+                self.assertEqual(src.transform,transform);after=src.read(1)
+            self.assertNotEqual(after[7,8],before[7,8]);self.assertEqual(after[14,8],before[14,8])
+            np.testing.assert_equal(before[~mask],after[~mask])
+            final=fusion_scores(root/'region',args.gt,root/'final',root/'result')
+            self.assertEqual(first['evaluation']['union'],final['evaluation']['union'])
+
     def test_joint_prompts_reach_sam_and_keep_one_child_through_export(self):
         class JointPredictor:
             model=SimpleNamespace(mask_threshold=0)

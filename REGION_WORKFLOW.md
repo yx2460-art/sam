@@ -124,3 +124,33 @@ python -m experiments.region_workflow score --experiment-dir outputs/region_case
 本轮评分包含union（融合起点）、previous_interactive（上一轮累计结果）、interactive（本轮累计结果）。同时报告相对union的累计变化与相对上一轮的变化，不保证每轮都提升。changed_pixels仅表示本轮相对上一轮的改动像素；interaction_round和previous_result记录链路，prompt_points记录本轮输入点数。历史报告缺少点数时不要推算总点击成本，需结合各轮原始点JSON及失败重试另行汇总。
 
 再下一条使用新的目录名，并将from-result改为outputs/region_case2_round2_result，依次累计；保持目标为剩余父实例ID 2，除非页面显示目标已经不再存在。不能以结果变好为理由删除失败记录，也不能为提高分数而按GT描边。
+
+## 斜向细长田块：斜矩形＋正负点
+
+SAM原生接口的box是水平XYXY矩形，不接受角度。本流程采用**完整上下文影像旋转＋提示坐标变换**：人工画斜矩形，将其长边旋转至水平，在旋转图上把水平框和全部正负点共同传给SAM，然后将全分辨率候选logits双线性插值回原始网格。不是用斜框的水平包围框代替斜框，也不将预测掩膜硬裁成矩形。原始RGB经旋转插值，可能影响细边界，因此该尝试需与纯点模式分别记录，不能保证一定改善。
+
+继续使用第二轮已确认结果（第三轮纯点失败未应用），创建独立的目标框尝试：
+
+```bash
+python -m experiments.region_workflow start --experiment-dir outputs/region_case2 --fusion-scores outputs/region_case2_fusion_eval --fusion union --from-result outputs/region_case2_round2_result --target-id 2 --interaction-mode single-target --reason "Third parcel: rotated target box and joint points after point-only failure" --output-dir outputs/region_case2_round3_box
+```
+
+打开outputs/region_case2_round3_box/index.html：
+
+1. 页面“操作”下拉框选“画斜框”后，沿目标田块一条长边，先点左端，再点右端；再在另一条长边附近点一下，确定宽度。第三点只确定与首条边的垂直距离，不要求与端点对齐。青色框应包住单条目标及少量余量，不必描出精准田埂。框允许覆盖上下文，但四角不能超出当前影像。
+2. “操作”切回“标正负点”，再在“点击类型”选“正点”，在目标田块内部放点；全部正点必须在斜框内。切换“负点”，在不希望包含的邻块内部放点，负点可以在框外。正负点仍须位于未变暗的固定区域内，最多8点；三个框点单独记录，不占正负点名额。
+3. “清除斜框”可重画，“撤销”撤销正负点。斜框可选：不画框仍按原正负点流程；不完整的1或2个框点不能导出。恢复JSON会同时恢复框及正负点，仅能导入相同项目哈希的标注。
+4. 导出region_points.json放在本项目目录内，然后运行：
+
+```bash
+python -m experiments.region_workflow infer --project-dir outputs/region_case2_round3_box --points outputs/region_case2_round3_box/region_points.json --checkpoint "$HOME/xy/sam/segment-anything/sam_vit_b_01ec64.pth" --output-dir outputs/region_case2_round3_box_proposals1
+```
+
+注意页面下拉框中“正点”“负点”仍用于标注点；“斜框”用于三个几何点击，不能拿框角点充当正点。标注JSON的oriented_box记录三个输入点，proposals.json额外记录四个原图角点、旋转矩阵、旋转图SAM框和插值方法。review.html和diagnostics.html显示的是映射回原图的候选。其他已有ID继续保护，最终仅固定ROI内回写，地理变换和评分ROI不变。region_result.json的box_clicks记录框的3次输入，prompt_points记录正负点数；重画和失败重试的成本需另行保留。
+
+候选合理才勾选、导出split_approvals.json放入本候选目录，再执行：
+
+```bash
+python -m experiments.region_workflow apply --proposals-dir outputs/region_case2_round3_box_proposals1 --approvals outputs/region_case2_round3_box_proposals1/split_approvals.json --output-dir outputs/region_case2_round3_box_result1
+python -m experiments.region_workflow score --experiment-dir outputs/region_case2 --gt "$HOME/xy/data/qgis_label_result3/instance.tif" --result-dir outputs/region_case2_round3_box_result1 --output-dir outputs/region_case2_round3_box_eval1
+```

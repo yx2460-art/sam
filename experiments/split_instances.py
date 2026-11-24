@@ -185,7 +185,9 @@ def split_candidate(rgb,parent,points,predictor,min_area=30,min_score=.8,source=
                 rejection_codes=reasons,eligible=not reasons,selected=False)
             seed_record['candidates'].append(record)
             if grouped:
-                record.update(prompt_points=points,point_labels=point_labels)
+                record.update(prompt_points=points,point_labels=point_labels,
+                    raw_contains_points=[j+1 for j,((xx,yy),label) in enumerate(zip(prompts,point_labels)) if label==1 and raw_mask[yy,xx]],
+                    raw_contains_negative_points=[j+1 for j,((xx,yy),label) in enumerate(zip(prompts,point_labels)) if label==0 and raw_mask[yy,xx]])
             if diagnostic_sink: diagnostic_sink(record,raw_mask,binary,component)
             if reasons: continue
             candidates.append((float(score),raw,component,candidate_index))
@@ -235,6 +237,7 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
     grouped=selection.get('interaction_mode')=='single-target'
     if selection.get('interaction_mode') not in (None,'single-target'): raise ValueError('Unknown interaction mode')
     if not grouped and any('point_labels' in item for item in items): raise ValueError('Labels require single-target interaction mode')
+    if not grouped and any('oriented_box' in item for item in items): raise ValueError('Oriented box requires single-target interaction mode')
     # Validate all annotations before loading SAM.
     with rasterio.open(m['instances']) as src,rasterio.open(m['image']) as image:
         for item in items:
@@ -248,6 +251,9 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
             labels=item.get('point_labels')
             if grouped and (not isinstance(labels,list) or len(labels)!=len(pts) or any(type(v) is not int or v not in (0,1) for v in labels) or 1 not in labels):
                 raise ValueError('Grouped prompts require binary labels and at least one positive')
+            if 'oriented_box' in item:
+                from .oriented_prompt import validate_prompts
+                validate_prompts(item['oriented_box'],parent.shape,pts,labels)
             item['point_roles']=[]
             for number,p in enumerate(pts,1):
                 if len(p)!=2 or any(type(v) is not int for v in p): raise ValueError('Integer pixel points required')
@@ -272,10 +278,18 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
             valid=np.all(image.read_masks(m['rgb_bands'],window=win)>0,axis=0)&np.isfinite(image.read(m['rgb_bands'],window=win)).all(axis=0)
             from .split_diagnostics import image_sink
             sink=image_sink(output/'diagnostics',lab,rgb)
-            patch,detail=split_candidate(rgb,parent,item['points'],predictor,min_area,min_score,source=original,valid=valid,diagnostic_sink=sink,prompt_mode=prompt_mode,point_labels=item.get('point_labels') if grouped else None)
+            active_predictor=predictor
+            if 'oriented_box' in item:
+                from .oriented_prompt import OrientedPredictor
+                active_predictor=OrientedPredictor(predictor,item['oriented_box'])
+            patch,detail=split_candidate(rgb,parent,item['points'],active_predictor,min_area,min_score,source=original,valid=valid,diagnostic_sink=sink,prompt_mode=prompt_mode,point_labels=item.get('point_labels') if grouped else None)
             entry=dict(id=lab,xyxy=row['xyxy'],points=item['points'],point_roles=item['point_roles'],
                        detail=detail,status='rejected',editable='parent_and_background')
             if grouped: entry['point_labels']=item['point_labels']
+            if 'oriented_box' in item:
+                entry['oriented_box']=active_predictor.audit()
+                for diagnostic in detail.get('diagnostics',[]):
+                    diagnostic['oriented_box']=entry['oriented_box']
             shutil.copyfile(project/f'{lab}_target.png',output/f'{lab}_before.png')
             if patch is not None:
                 ids=list(range(next_id,next_id+len(detail['children'])));next_id+=len(ids)
@@ -292,13 +306,17 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
             proposals.append(entry)
     sealed(project/'project.json')
     if any(digest(p)!=value for p,value in hashes.items()): raise ValueError('Inputs changed during inference')
+    has_boxes=[bool(entry.get('oriented_box')) for entry in proposals]
+    effective_mode=('rotated-box+points' if all(has_boxes) else 'mixed-rotated-box-and-points') if any(has_boxes) else prompt_mode
     report=dict(status='ready_for_review',operation='parent_refinement_and_background_completion',
         project=str(project),project_sha256=digest(project/'project.json'),
-        proposals=proposals,min_area=min_area,min_score=min_score,prompt_mode=prompt_mode,interaction_mode='single-target' if grouped else 'separate-parcels',input_sha256=hashes,ground_truth_used=False)
+        proposals=proposals,min_area=min_area,min_score=min_score,prompt_mode=effective_mode,interaction_mode='single-target' if grouped else 'separate-parcels',input_sha256=hashes,ground_truth_used=False)
     (output/'proposals.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
     cards=[]
     for r in proposals:
         lab=r['id'];card=f'<h2>源实例 {lab}</h2><img src="{lab}_before.png" style="max-width:45%">'
+        if 'oriented_box' in r:
+            card+='<p>本组使用斜矩形：旋转影像后向SAM输入水平框及正负点，再将候选映射回原图；未按矩形裁切掩膜。旋转插值可能影响细边界，需复核。</p>'
         if r['status']=='proposal':
             card+=f'<img src="{lab}_after.png" style="max-width:45%"><p>彩色为候选新实例，原实例剩余像素保留。剩余：{r["detail"]["residual_pixels"]}，新增前景：{r["detail"].get("added_foreground_pixels",0)} 像素。</p><label><input type="checkbox" id="a{lab}">确认接受此候选（包括背景补充分割）</label>'
         else: card+='<p>本组没有保留候选，原实例保持不变。请查看逐点诊断，区分模型输出与筛选原因。</p>'
@@ -313,10 +331,10 @@ def infer(project,points_path,checkpoint,output,device='cuda:0',min_area=30,min_
         cards.append(card)
     config=json.dumps(dict(hash=digest(output/'proposals.json'),ids=[r['id'] for r in proposals if r['status']=='proposal']))
     script='const c='+config+''';function download(){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify({proposals_sha256:c.hash,accepted_ids:c.ids.filter(id=>document.getElementById('a'+id).checked)},null,2)],{type:'application/json'}));a.download='split_approvals.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}'''
-    (output/'review.html').write_text('<!doctype html><meta charset="utf-8"><h1>拆分候选确认</h1><p>交互：'+('同一目标正负点联合提示' if grouped else '不同田块独立正点')+'；提示模式：'+prompt_mode+'。未勾选即保留原实例。不看GT后挑选。</p><button onclick="download()">导出确认JSON</button>'+''.join(cards)+'<script>'+script+'</script>',encoding='utf-8')
+    (output/'review.html').write_text('<!doctype html><meta charset="utf-8"><h1>拆分候选确认</h1><p>交互：'+('同一目标正负点联合提示' if grouped else '不同田块独立正点')+'；提示模式：'+effective_mode+'。未勾选即保留原实例。不看GT后挑选。</p><button onclick="download()">导出确认JSON</button>'+''.join(cards)+'<script>'+script+'</script>',encoding='utf-8')
     from .split_diagnostics import write_report
     write_report(output,proposals,min_area,min_score)
-    lines=[f'Prompt mode: {prompt_mode}; min_score={min_score}; min_area={min_area}; no GT read.',
+    lines=[f'Prompt mode: {effective_mode}; min_score={min_score}; min_area={min_area}; no GT read.',
            'Retained candidates are proposals, not confirmed correct parcels.']
     for p in proposals:
         lines.append(f"Instance {p['id']}: {p['status']}")
