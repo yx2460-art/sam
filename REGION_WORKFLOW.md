@@ -154,3 +154,22 @@ python -m experiments.region_workflow infer --project-dir outputs/region_case2_r
 python -m experiments.region_workflow apply --proposals-dir outputs/region_case2_round3_box_proposals1 --approvals outputs/region_case2_round3_box_proposals1/split_approvals.json --output-dir outputs/region_case2_round3_box_result1
 python -m experiments.region_workflow score --experiment-dir outputs/region_case2 --gt "$HOME/xy/data/qgis_label_result3/instance.tif" --result-dir outputs/region_case2_round3_box_result1 --output-dir outputs/region_case2_round3_box_eval1
 ```
+
+## 第三轮后：先诊断边界下降，再决定是否修正
+
+实例F1/PQ提升而边界F1下降时，先生成事后诊断页，不重跑SAM、不自动平滑或修改预测、不改变评分容差：
+
+```bash
+python -m experiments.diagnose_region --experiment-dir outputs/region_case2 --result-dir outputs/region_case2_round3_box_result1 --gt "$HOME/xy/data/qgis_label_result3/instance.tif" --output-dir outputs/region_case2_round3_boundary_diagnosis
+```
+
+打开新目录index.html。页面包含求并起点、第二轮累计结果、第三轮累计结果三组对照（上一轮路径从已确认结果自动读取，无需另指定）：
+
+- 左图原图叠加：预测边界黄、真值边界青、同像素重合白。此图用于观察，不把ROI裁切边缘当作田块边界。
+- 右图评分边界：容差内预测边界绿、容差外预测边界红、未匹配真值边界蓝。使用与原评分完全相同的方形容差及ROI向内收缩设置。大量红色可能是偏移或额外内部边界，蓝色表示漏掉真值边界，仍须结合影像判断。
+- 本轮改动图：正确补前景绿、错误补前景红、错误删前景蓝、正确删前景紫、前景内实例ID变更黄。ID变更只表示重新归属，不等同于拆分正确。此图只统计固定评分域内相对第二轮的变化。
+- 各阶段_instances.csv：预测ID、ROI内面积、最佳重叠GT及IoU、按原有IoU>=0.5贪心规则得到的实际匹配。diagnostics.json额外列出未匹配GT和本轮新出现的预测ID；最佳重叠不保证成为实际匹配。
+
+检查新实例是否匹配GT、未匹配边界是否集中在新实例两侧／两端、父实例剩余像素是否留下细带或碎片。将第三轮右侧边界图、本轮改动图和summary.txt一起查看后，再决定补点修正或继续提取下一条，不预先认定一定是旋转插值或模型错误。
+
+诊断输出的scores/summary.txt应与第三轮原评分一致；边界计数在运行时逐项与评分核验。所有图均映射到原网格，输出不更改已确认实例。GT叠加页只用于开发诊断，不是交互提示页面；看过GT后的后续调整不能称为独立盲测，不应按GT边界逐像素描绘提示。

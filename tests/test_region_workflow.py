@@ -48,6 +48,13 @@ class RegionWorkflowTests(unittest.TestCase):
             np.testing.assert_equal(before[~mask],after[~mask])
             final=fusion_scores(root/'region',args.gt,root/'final',root/'result')
             self.assertEqual(first['evaluation']['union'],final['evaluation']['union'])
+            from experiments.diagnose_region import diagnose
+            before_hash=digest(root/'result'/'region_result.tif')
+            diagnosis=diagnose(root/'region',root/'result',args.gt,root/'diagnose')
+            self.assertEqual(diagnosis['evaluation'],final['evaluation'])
+            self.assertEqual(before_hash,digest(root/'result'/'region_result.tif'))
+            self.assertTrue((root/'diagnose'/'index.html').exists())
+            self.assertTrue(diagnosis['new_pred_ids'])
 
     def test_joint_prompts_reach_sam_and_keep_one_child_through_export(self):
         class JointPredictor:
@@ -110,6 +117,10 @@ class RegionWorkflowTests(unittest.TestCase):
             final=fusion_scores(root/'region',args.gt,root/'second_final',root/'second_result')
             self.assertEqual(final['interaction_round'],2)
             self.assertIn('previous_interactive',final['evaluation'])
+            from experiments.diagnose_region import diagnose
+            diagnosis=diagnose(root/'region',root/'second_result',args.gt,root/'diagnose_second')
+            self.assertEqual(diagnosis['last_round_reference'],'previous_interactive')
+            self.assertEqual(diagnosis['evaluation'],final['evaluation'])
             (root/'empty_approve.json').write_text(json.dumps(dict(proposals_sha256=digest(root/'second_proposals'/'proposals.json'),accepted_ids=[])))
             with self.assertRaisesRegex(ValueError,'No candidate accepted'):
                 apply(root/'second_proposals',root/'empty_approve.json',root/'empty_result')
