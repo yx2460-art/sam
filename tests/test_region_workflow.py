@@ -103,6 +103,16 @@ class RegionWorkflowTests(unittest.TestCase):
             self.assertEqual(sum(row['pixels'] for row in diagnosis['residual']['components']),diagnosis['residual']['roi_pixels'])
             self.assertTrue((root/'diagnose'/'index.html').exists())
             self.assertTrue(diagnosis['new_pred_ids'])
+            from experiments.inspect_region_ids import prepare as inspect_ids
+            actual_open=rasterio.open
+            def no_gt_inspection(path,*a,**kw):
+                self.assertNotEqual(Path(path).resolve(),args.gt.resolve())
+                return actual_open(path,*a,**kw)
+            with patch('rasterio.open',side_effect=no_gt_inspection):
+                inspected=inspect_ids(root/'result',root/'id_view')
+            self.assertEqual(sum(inspected['roi_id_pixels'].values()),first['scoring_pixels'])
+            self.assertEqual(before_hash,digest(root/'result'/'region_result.tif'))
+            self.assertTrue((root/'id_view'/'index.html').exists())
             from experiments.merge_residuals import prepare as merge_prepare,apply as merge_apply
             actual=rasterio.open
             def no_gt(path,*a,**kw):

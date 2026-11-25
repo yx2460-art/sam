@@ -241,3 +241,17 @@ python -m experiments.region_workflow score --experiment-dir outputs/region_case
 设为背景的导出记录必须同时包含target_id:0与action:background；仅把旧文件数字改为0不会被接受。旧版plan未声明支持背景清理也会拒绝背景操作。apply不读取GT，只处理人工确认的残余，不删除其他实例。报告分别记录merged_pixels和removed_foreground_pixels；包含实际删除时写策略为reviewed-background-cleanup，否则仍是preserve-foreground-residual-merge。不同策略分别保存、分别报告。
 
 本方案改变前景范围，IoU不再保证0.873536，可能提高也可能下降；必须与第六轮及仅归并对照并列评价，不覆盖旧成果。
+
+## 清理后继续处理上方粘连：先定位当前ID
+
+前六轮处理的是父实例2，不能默认上方田块也属于2。用最新清理结果生成离线ID查看页：
+
+```bash
+python -m experiments.inspect_region_ids --result-dir outputs/region_case2_round6_cleanup_result1 --output-dir outputs/region_case2_upper_ids
+```
+
+打开index.html，分别在上方疑似粘连的多个真实田块内部点击。页面显示当前实例ID、局部坐标、原图坐标及是否在固定评分／回写域内。可切换只看原影像。相同ID不能直接证明粘连（可能是同ID多个分离区域），需结合真实田埂；不同ID则已在标签上分开。变暗域内即使有ID，也不能在当前实验回写，需另建固定区域，不能扩大旧评分ROI。
+
+确认实际目标ID后，沿用region_workflow start，from-result必须是outputs/region_case2_round6_cleanup_result1，target-id替换为点击得到的真实ID，使用新的region_case2_upper_round1目录。第一份fusion-scores和fusion方法仍保持原先设置，使用single-target斜框＋正负点模式；保护其他已完成ID，不回到早期union。先检查候选再接受。若继续选择preserve-foreground，其IoU应保持最新清理结果的0.875449，而非清理前0.873536。清理与后续SAM交互是不同操作阶段，均保留记录。
+
+ID查看页不读取GT、不运行SAM、不修改结果。确认目标位置和ID之后再启动下一轮，避免针对错误父实例。
