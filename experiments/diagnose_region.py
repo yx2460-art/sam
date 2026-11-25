@@ -65,7 +65,26 @@ def paint(rgb,codes,mask,palette):
     return view
 
 
-def diagnose(experiment,result,gt_path,output):
+def residual_components(data,mask,target_id,offset=(0,0)):
+    selected=(data==target_id)&mask
+    labels,count=ndimage.label(selected,structure=np.ones((3,3)))
+    edge=mask&~ndimage.binary_erosion(mask,border_value=0)
+    rows=[]
+    for index,box in enumerate(ndimage.find_objects(labels),1):
+        if box is None:continue
+        ys,xs=box;component=labels[box]==index
+        local=(slice(max(0,ys.start-1),min(mask.shape[0],ys.stop+1)),slice(max(0,xs.start-1),min(mask.shape[1],xs.stop+1)))
+        surroundings=ndimage.binary_dilation(labels[local]==index,structure=np.ones((3,3)))&mask[local]&(labels[local]!=index)
+        ids,areas=np.unique(data[local][surroundings],return_counts=True)
+        rows.append(dict(component=index,pixels=int(component.sum()),
+            local_xyxy=[xs.start,ys.start,xs.stop,ys.stop],
+            global_xyxy=[xs.start+offset[0],ys.start+offset[1],xs.stop+offset[0],ys.stop+offset[1]],
+            touches_roi_edge=bool(np.any(edge[box]&component)),
+            adjacent_ids={str(int(i)):int(n) for i,n in zip(ids,areas)}))
+    return labels.astype(np.uint32),sorted(rows,key=lambda row:(-row['pixels'],row['component']))
+
+
+def diagnose(experiment,result,gt_path,output,inspect_id=None):
     experiment,m=load(experiment);result=Path(result).resolve();output=Path(output).resolve();gt_path=Path(gt_path).resolve()
     if output.exists():raise FileExistsError('Use a new diagnostic output directory')
     # Reuse all score provenance/GT/grid checks; no SAM inference and no candidate selection.
@@ -106,11 +125,30 @@ def diagnose(experiment,result,gt_path,output):
     save_labels(output/'last_round_changes.tif',codes,profile)
     save_png(output/'last_round_changes.png',paint(rgb,codes,mask,{1:[20,220,80],2:[255,40,40],3:[40,140,255],4:[220,80,220],5:[255,220,0]}))
     new_ids=sorted(set(np.unique(arrays['interactive'][mask]).tolist())-set(np.unique(arrays[previous_name][mask]).tolist())-{0})
+    target_id=workflow['target_id'] if inspect_id is None else inspect_id
+    if type(target_id) is not int or target_id<=0:raise ValueError('Residual inspection requires a positive instance ID')
+    current=arrays['interactive'];component_map,components=residual_components(current,mask,target_id,(x0,y0))
+    save_labels(output/'residual_components.tif',component_map,profile)
+    highlight=np.zeros(mask.shape,dtype=np.uint32);highlight[np.isin(current,new_ids)&mask]=2
+    highlight[(current==target_id)&mask]=1
+    residual_view=paint(rgb,highlight,mask,{1:[255,45,45],2:[0,220,255]})
+    save_png(output/'residual_overview.png',residual_view)
+    with (output/'residual_components.csv').open('w',newline='',encoding='utf-8-sig') as stream:
+        writer=csv.DictWriter(stream,fieldnames=['component','pixels','local_xyxy','global_xyxy','touches_roi_edge','adjacent_ids'])
+        writer.writeheader();writer.writerows(components)
+    crops=[]
+    for row in components[:12]:
+        a,b,c,d=row['local_xyxy'];a=max(0,a-24);b=max(0,b-24);c=min(mask.shape[1],c+24);d=min(mask.shape[0],d+24)
+        name=f'residual_component_{row["component"]}.png'
+        save_png(output/name,residual_view[b:d,a:c])
+        crops.append(f'<h3>连通区域 {row["component"]}：{row["pixels"]} 像素</h3><p>原图范围 {row["global_xyxy"]}；邻接ID及邻接像素数 {html.escape(str(row["adjacent_ids"]))}；接触评分域边缘：{row["touches_roi_edge"]}</p><img src="{name}">')
+    residual=dict(target_id=target_id,roi_pixels=int((component_map>0).sum()),
+        context_pixels=int((current==target_id).sum()),component_count=len(components),connectivity=8,components=components)
     report=dict(status='complete',warning='GT-visible development diagnosis; not a blind test and not an editing/prompt page',
         write_policy=r.get('write_policy','parent-and-background'),
         evaluation=score['evaluation'],boundary_tolerance=m['boundary_tolerance'],scoring_pixels=m['scoring_pixels'],
         context_xyxy=m['context_xyxy'],last_round_reference=previous_name,new_pred_ids=new_ids,
-        last_round_changes=change_counts,diagnostics=details,
+        last_round_changes=change_counts,diagnostics=details,residual=residual,
         input_sha256={str(p):digest(p) for p in [experiment/'experiment.json',result/'region_result.json',gt_path,*paths.values()]})
     write_json(output/'diagnostics.json',report)
     lines=['GT-visible diagnosis only; no predictions changed.',f'Write policy: {report["write_policy"]}',f'Scoring pixels={m["scoring_pixels"]}; tolerance={m["boundary_tolerance"]} pixels']
@@ -118,6 +156,7 @@ def diagnose(experiment,result,gt_path,output):
     lines.extend([f'New instance IDs relative to {previous_name}: {new_ids}',f'Last-round changes: {change_counts}'])
     for row in details['interactive']['instances']:
         if row['pred_id'] in new_ids: lines.append(f'New instance match: {row}')
+    lines.append(f'Residual ID {target_id}: ROI pixels={residual["roi_pixels"]}; context pixels={residual["context_pixels"]}; 8-connected components={len(components)}')
     (output/'summary.txt').write_text('\n'.join(lines)+'\n',encoding='utf-8')
     (output/'index.html').write_text('<!doctype html><meta charset="utf-8"><title>区域交互后边界诊断</title>'
         '<style>body{font-family:sans-serif;margin:20px}.pair{display:flex;gap:1%}.pair img{width:49%;object-fit:contain}img{max-width:100%}p{line-height:1.6}</style>'
@@ -125,6 +164,7 @@ def diagnose(experiment,result,gt_path,output):
         f'本次回写策略：{html.escape(report["write_policy"])}。'
         f'固定评分像素 {m["scoring_pixels"]}；边界容差 {m["boundary_tolerance"]} 像素，评分域向内收缩容差＋1，忽略人为ROI边缘。图片可在新标签页放大查看。</p>'
         '<p><a href="scores/summary.txt">相同设置的完整评分</a>；<a href="diagnostics.json">诊断数据</a></p>'
+        +f'<h2>剩余父实例 ID {target_id} 检查（不叠加GT）</h2><p>红色：剩余目标ID；青色：本轮新实例；其他位置保留原影像。评分域内共{residual["roi_pixels"]}像素、{len(components)}个8连通区域。上下文内共{residual["context_pixels"]}像素。ROI裁切可能分断实例，邻接某ID不等于应合并。程序不删除、不合并残余。</p><img src="residual_overview.png"><p><a href="residual_components.csv">全部连通区域CSV</a>；下方展示面积最大的前12个局部图。</p>'+''.join(crops)
         +''.join(cards)+'<h2>本轮相对上一结果的改动</h2><p>绿：正确补前景；红：错误补前景；蓝：错误删前景；紫：正确删前景；黄：前景内ID改变（不等同于正确拆分）。</p>'
         '<img src="last_round_changes.png">'+f'<p>{html.escape(str(change_counts))}。新出现预测ID：{new_ids}。</p>',encoding='utf-8')
     print('\n'.join(lines));print(f'Open {output}/index.html; diagnosis only, no SAM inference')
@@ -135,7 +175,8 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--experiment-dir',type=Path,required=True);parser.add_argument('--result-dir',type=Path,required=True)
     parser.add_argument('--gt',type=Path,required=True);parser.add_argument('--output-dir',type=Path,required=True)
-    a=parser.parse_args();diagnose(a.experiment_dir,a.result_dir,a.gt,a.output_dir)
+    parser.add_argument('--inspect-id',type=int,help='Positive residual instance ID; default is workflow target')
+    a=parser.parse_args();diagnose(a.experiment_dir,a.result_dir,a.gt,a.output_dir,a.inspect_id)
 
 
 if __name__=='__main__':main()

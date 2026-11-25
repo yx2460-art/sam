@@ -2,11 +2,21 @@ import unittest
 
 import numpy as np
 
-from experiments.diagnose_region import boundary_errors,changes,instance_matches
+from experiments.diagnose_region import boundary_errors,changes,instance_matches,residual_components
 from experiments.evaluate_tiles import roi_counts
 
 
 class DiagnoseRegionTests(unittest.TestCase):
+    def test_residual_components_include_offsets_adjacency_and_roi_clipping(self):
+        data=np.zeros((10,12),dtype=np.uint32);data[2:5,2:4]=2;data[5,4]=2;data[7:9,8:10]=2
+        data[2:5,4]=354;mask=np.ones_like(data,dtype=bool);mask[8:]=False
+        labels,rows=residual_components(data,mask,2,(100,200))
+        self.assertEqual(len(rows),2);self.assertEqual(rows[0]['pixels'],7)
+        self.assertEqual(rows[0]['global_xyxy'],[102,202,105,206])
+        self.assertIn('354',rows[0]['adjacent_ids']);self.assertTrue(rows[1]['touches_roi_edge'])
+        self.assertEqual(int((labels>0).sum()),9);self.assertFalse(labels[~mask].any())
+        empty,rows=residual_components(data,mask,999)
+        self.assertEqual(rows,[]);self.assertFalse(empty.any())
     def test_boundary_maps_match_evaluator_with_holes_and_roi_edges(self):
         gt=np.zeros((30,35),dtype=np.uint32);gt[3:26,4:18]=1;gt[3:26,18:30]=2
         pred=gt.copy();pred[3:26,16:18]=2;pred[8:12,9:11]=0

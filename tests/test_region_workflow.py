@@ -98,6 +98,9 @@ class RegionWorkflowTests(unittest.TestCase):
             diagnosis=diagnose(root/'region',root/'result',args.gt,root/'diagnose')
             self.assertEqual(diagnosis['evaluation'],final['evaluation'])
             self.assertEqual(before_hash,digest(root/'result'/'region_result.tif'))
+            self.assertTrue((root/'diagnose'/'residual_overview.png').exists())
+            self.assertEqual(diagnosis['residual']['target_id'],anchor)
+            self.assertEqual(sum(row['pixels'] for row in diagnosis['residual']['components']),diagnosis['residual']['roi_pixels'])
             self.assertTrue((root/'diagnose'/'index.html').exists())
             self.assertTrue(diagnosis['new_pred_ids'])
 

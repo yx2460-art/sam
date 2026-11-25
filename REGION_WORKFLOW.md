@@ -189,3 +189,15 @@ python -m experiments.diagnose_region --experiment-dir outputs/region_case2 --re
 预期是本对照IoU、前景precision/recall/Dice与**第二轮起点**严格一致，而不是保证回到最初求并值；程序在回写时校验前景二值范围完全不变。实例F1、PQ和边界F1可能改变，需实测。背景限制也可能使新实例不连通或残留细带，此对照不额外填洞或造边界，不保证一定改善。
 
 对照三组：第二轮结果、原第三轮斜框结果、本次前景保持对照。比较同一GT和容差下的实例F1/PQ、边界F1与误差图。本次summary.txt会列出新实例的最佳GT重叠及实际匹配；新实例351是否匹配应以CSV/diagnostics.json为准，不能仅凭黄色ID变更面积推断。看过GT后设计的本对照属于开发分析，后续独立区域还需另行验证。
+
+## 第六轮后：检查剩余父实例，不按未匹配状态自动删除
+
+第六轮新实例354匹配真值233，但父实例2还剩6361个ROI像素，导致预测实例数增加、成功匹配数不变。先定位剩余区域，再决定是否归并、继续分割或删除，不以GT匹配失败作为自动删除条件。
+
+```bash
+python -m experiments.diagnose_region --experiment-dir outputs/region_case2 --result-dir outputs/region_case2_round6_result --gt "$HOME/xy/data/qgis_label_result3/instance.tif" --inspect-id 2 --output-dir outputs/region_case2_round6_residual_diagnosis
+```
+
+打开index.html，最上方新增“剩余父实例ID 2检查”：红色为固定评分域内的剩余ID 2，青色为本轮新实例354，其余显示原影像，此面板不叠加GT。residual_overview.png为总览；residual_component_编号.png为面积最大的前12个连通区域局部图。局部图含24像素观察余量，并同时显示附近其他残余。全部区域位置信息在residual_components.csv和diagnostics.json：像素面积、局部／原图包围框、是否接触ROI边缘、邻接ID及邻接像素数。residual_components.tif保留原网格、按8连通编号。
+
+统计仅对评分域内分量进行，ROI裁切可能把同一个实例分断；context_pixels另报告上下文裁块中该ID的总像素，不能当作全图面积。相邻或小面积不证明应合并／删除。重点观察6361像素是否沿已提取田块边缘分布、是否形成有实际田埂围合的独立区域，结合原影像决定下一项受控实验。保留第六轮和第五轮结果，不自动清理任何实例，不重跑SAM、不改变评价设置。
