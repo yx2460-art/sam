@@ -103,6 +103,40 @@ class RegionWorkflowTests(unittest.TestCase):
             self.assertEqual(sum(row['pixels'] for row in diagnosis['residual']['components']),diagnosis['residual']['roi_pixels'])
             self.assertTrue((root/'diagnose'/'index.html').exists())
             self.assertTrue(diagnosis['new_pred_ids'])
+            from experiments.merge_residuals import prepare as merge_prepare,apply as merge_apply
+            actual=rasterio.open
+            def no_gt(path,*a,**kw):
+                self.assertNotEqual(Path(path).resolve(),args.gt.resolve())
+                return actual(path,*a,**kw)
+            with patch('rasterio.open',side_effect=no_gt):
+                plan=merge_prepare(root/'result',root/'merge_project',target_id=anchor)
+            eligible=[row for row in plan['components'] if row['allowed_targets']]
+            self.assertTrue(eligible)
+            selected=eligible[0];target=selected['allowed_targets'][0]
+            decisions=dict(plan_sha256=digest(root/'merge_project'/'plan.json'),assignments=[dict(component=selected['component'],target_id=target)])
+            (root/'merge_decisions.json').write_text(json.dumps(decisions))
+            with patch('rasterio.open',side_effect=no_gt):
+                merged=merge_apply(root/'merge_project',root/'merge_decisions.json',root/'merged_result')
+            self.assertEqual(merged['changed_pixels'],selected['pixels'])
+            self.assertEqual(before_hash,digest(root/'result'/'region_result.tif'))
+            with actual(root/'merge_project'/'components.tif') as src:components=src.read(1)
+            with actual(root/'merged_result'/'region_result.tif') as src:merged_data=src.read(1)
+            np.testing.assert_equal(merged_data>0,after>0)
+            chosen=components==selected['component']
+            self.assertTrue(np.all(merged_data[chosen]==target))
+            np.testing.assert_equal(merged_data[~chosen],after[~chosen])
+            merged_scores=fusion_scores(root/'region',args.gt,root/'merged_eval',root/'merged_result')
+            self.assertEqual(merged_scores['evaluation']['previous_interactive'],final['evaluation']['interactive'])
+            self.assertEqual(merged_scores['evaluation']['interactive']['mask_iou'],final['evaluation']['interactive']['mask_iou'])
+            decisions['assignments'][0]['target_id']=0
+            (root/'bad_merge.json').write_text(json.dumps(decisions))
+            with self.assertRaisesRegex(ValueError,'Invalid'):
+                merge_apply(root/'merge_project',root/'bad_merge.json',root/'bad_merged_result')
+            self.assertFalse((root/'bad_merged_result').exists())
+            decisions['assignments']=[]
+            (root/'empty_merge.json').write_text(json.dumps(decisions))
+            with self.assertRaisesRegex(ValueError,'No residual'):
+                merge_apply(root/'merge_project',root/'empty_merge.json',root/'empty_merge_result')
 
     def test_joint_prompts_reach_sam_and_keep_one_child_through_export(self):
         class JointPredictor:

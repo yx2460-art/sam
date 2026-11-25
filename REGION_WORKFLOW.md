@@ -201,3 +201,22 @@ python -m experiments.diagnose_region --experiment-dir outputs/region_case2 --re
 打开index.html，最上方新增“剩余父实例ID 2检查”：红色为固定评分域内的剩余ID 2，青色为本轮新实例354，其余显示原影像，此面板不叠加GT。residual_overview.png为总览；residual_component_编号.png为面积最大的前12个连通区域局部图。局部图含24像素观察余量，并同时显示附近其他残余。全部区域位置信息在residual_components.csv和diagnostics.json：像素面积、局部／原图包围框、是否接触ROI边缘、邻接ID及邻接像素数。residual_components.tif保留原网格、按8连通编号。
 
 统计仅对评分域内分量进行，ROI裁切可能把同一个实例分断；context_pixels另报告上下文裁块中该ID的总像素，不能当作全图面积。相邻或小面积不证明应合并／删除。重点观察6361像素是否沿已提取田块边缘分布、是否形成有实际田埂围合的独立区域，结合原影像决定下一项受控实验。保留第六轮和第五轮结果，不自动清理任何实例，不重跑SAM、不改变评价设置。
+
+## 第六轮残余：人工逐区域确认归属后再评分
+
+```bash
+python -m experiments.merge_residuals prepare --result-dir outputs/region_case2_round6_result --target-id 2 --output-dir outputs/region_case2_round6_merge_review
+```
+
+打开新目录index.html。本页不读取或叠加GT，不使用GT决定候选，不运行SAM。每个8连通残余区域有编号、面积、原图和着色对照。右图红色只表示本区域，相邻已有实例以半透明颜色表示，图下注明ID。下拉框默认“保留原ID，不修改”；仅在根据原影像田埂确认归属后选择目标ID。有多个邻接ID时自行判断，不按面积或距离自动决定。没有邻接实例的孤立斑块本轮只能保留，不允许强行并到远处、不允许归零删除。可只处理少量明确区域，有歧义不选。ROI裁切边缘可能造成假分离，应保留疑问区域。
+
+导出merge_decisions.json放入本项目目录。决策文件绑定plan.json哈希，只记录明确选择的区域。然后运行：
+
+```bash
+python -m experiments.merge_residuals apply --project-dir outputs/region_case2_round6_merge_review --decisions outputs/region_case2_round6_merge_review/merge_decisions.json --output-dir outputs/region_case2_round6_merge_result1
+python -m experiments.region_workflow score --experiment-dir outputs/region_case2 --gt "$HOME/xy/data/qgis_label_result3/instance.tif" --result-dir outputs/region_case2_round6_merge_result1 --output-dir outputs/region_case2_round6_merge_eval1
+```
+
+apply只修改确认分量的实例ID，不读取GT；其他ID和未确认残余不改，前景范围、地理网格和固定ROI保持不变，原第六轮文件不覆盖。评分表previous_interactive是第六轮原结果，interactive为归并后；同时保留原始融合对照。写策略记录为preserve-foreground-residual-merge，操作记录为residual-merge，并非新增SAM轮次。决策为空、重复区域、目标不相邻、原文件改变、输出目录存在都会拒绝执行。
+
+IoU应仍为0.873536，实例F1、PQ、边界F1须实测。部分归并可能使剩余ID 2继续作为未匹配实例存在，不能仅为了减少FP而强行归并全部区域。后续继续归并应使用已确认的归并结果重新prepare，以保留先前修改和新的邻接关系。人工审核已受先前开发诊断影响，不能称为独立盲测。
