@@ -133,6 +133,18 @@ class RegionWorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'Invalid'):
                 merge_apply(root/'merge_project',root/'bad_merge.json',root/'bad_merged_result')
             self.assertFalse((root/'bad_merged_result').exists())
+            decisions['assignments'][0]['action']='background'
+            (root/'background_merge.json').write_text(json.dumps(decisions))
+            with patch('rasterio.open',side_effect=no_gt):
+                cleaned=merge_apply(root/'merge_project',root/'background_merge.json',root/'cleaned_result')
+            self.assertEqual(cleaned['removed_foreground_pixels'],selected['pixels'])
+            self.assertEqual(cleaned['merged_pixels'],0)
+            self.assertEqual(cleaned['write_policy'],'reviewed-background-cleanup')
+            with actual(root/'cleaned_result'/'region_result.tif') as src:cleaned_data=src.read(1)
+            self.assertTrue(np.all(cleaned_data[chosen]==0))
+            np.testing.assert_equal(cleaned_data[~chosen],after[~chosen])
+            cleaned_scores=fusion_scores(root/'region',args.gt,root/'cleaned_eval',root/'cleaned_result')
+            self.assertEqual(cleaned_scores['write_policy'],'reviewed-background-cleanup')
             decisions['assignments']=[]
             (root/'empty_merge.json').write_text(json.dumps(decisions))
             with self.assertRaisesRegex(ValueError,'No residual'):

@@ -1,4 +1,4 @@
-"""Human-reviewed residual component reassignment; no GT, deletion, or SAM inference."""
+"""Human-reviewed residual reassignment or explicit background cleanup; no GT or SAM."""
 import argparse
 import html
 import json
@@ -46,22 +46,26 @@ def prepare(result,output,target_id=2):
             legend.append(f'<span style="border-bottom:5px solid {color}">ID {lab}</span>')
         view[components[b:d,a:c]==index]=[255,40,40]
         save_png(output/f'{index}_raw.png',raw);save_png(output/f'{index}_review.png',view)
-        options='<option value="0">保留原ID，不修改</option>'+''.join(f'<option value="{lab}">并入ID {lab}</option>' for lab in targets)
+        options='<option value="keep">保留原ID，不修改</option><option value="background">确认为背景／田埂（设为ID 0）</option>'+''.join(f'<option value="{lab}">并入ID {lab}</option>' for lab in targets)
         cards.append(f'<section><h2>区域 {index}：{row["pixels"]}像素</h2><p>原图范围 {row["global_xyxy"]}；接触ROI边缘：{row["touches_roi_edge"]}。</p>'
             f'<div class="pair"><img src="{index}_raw.png"><img src="{index}_review.png"></div><p>左：原图；右：本区域红色，相邻实例半透明着色。'+ '；'.join(legend)+
-            f'</p><label>归属选择 <select id="c{index}">{options}</select></label><p>相邻不代表应归并；有歧义保持原ID。无相邻实例的孤立斑块本轮不处理。</p></section>')
+            f'</p><label>归属选择 <select id="c{index}">{options}</select></label><p>每项操作作用于本编号全部红色像素。只有整个区域都应为背景时才选ID 0；部分田块、部分田埂的混合区域先保留。有歧义保持原ID。</p></section>')
     inputs=[result/'region_result.json',old_project/'workflow.json',experiment/'experiment.json',source,Path(m['mask']),Path(m['image']),output/'components.tif']
     plan=dict(status='ready',operation='review-residual-merge',source_result=str(result),experiment=str(experiment),target_id=target_id,
-        source=str(source),mask=m['mask'],components=rows,gt_used_for_proposals=False,input_sha256={str(p):digest(p) for p in inputs})
+        source=str(source),mask=m['mask'],components=rows,allow_background_cleanup=True,gt_used_for_proposals=False,input_sha256={str(p):digest(p) for p in inputs})
     write_json(output/'plan.json',plan)
-    workflow=dict(old_workflow,previous_result=str(result),reason='Human-reviewed residual reassignment; foreground unchanged',
+    workflow=dict(old_workflow,previous_result=str(result),reason='Human-reviewed residual reassignment and optional explicit background cleanup',
         target_id=target_id,operation='residual-merge',input_sha256={str(p):digest(p) for p in [output/'plan.json',old_project/'workflow.json',experiment/'experiment.json']})
     write_json(output/'workflow.json',workflow)
     config=json.dumps(dict(hash=digest(output/'plan.json'),ids=[row['component'] for row in rows]))
-    script='const config='+config+''';function download(){const assignments=config.ids.map(component=>({component,target_id:Number(document.getElementById('c'+component).value)})).filter(r=>r.target_id!==0);
-if(!assignments.length){alert('没有选择归并区域，默认全部保留');return;}const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify({plan_sha256:config.hash,assignments},null,2)],{type:'application/json'}));a.download='merge_decisions.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}'''
+    script='const config='+config+''';function download(){const assignments=config.ids.map(component=>{const v=document.getElementById('c'+component).value;return v==='keep'?null:{component,target_id:v==='background'?0:Number(v),action:v==='background'?'background':'merge'};}).filter(Boolean);
+if(!assignments.length){alert('没有选择修改区域，默认全部保留');return;}const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify({plan_sha256:config.hash,assignments},null,2)],{type:'application/json'}));a.download='merge_decisions.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}
+async function restore(input){try{const v=JSON.parse(await input.files[0].text());if(v.plan_sha256!==config.hash||!Array.isArray(v.assignments))throw Error('请选择本页面导出的决策文件');
+const checked=[],seen=new Set();for(const r of v.assignments){const select=document.getElementById('c'+r.component),value=r.action==='background'&&r.target_id===0?'background':String(r.target_id);
+if(!select||seen.has(r.component)||!Array.from(select.options).some(o=>o.value===value))throw Error('决策区域或目标不匹配');seen.add(r.component);checked.push([select,value]);}
+config.ids.forEach(id=>document.getElementById('c'+id).value='keep');checked.forEach(([select,value])=>select.value=value);}catch(e){alert(e.message);}}'''
     (output/'index.html').write_text('<!doctype html><meta charset="utf-8"><title>残余人工归属确认</title><style>body{font-family:sans-serif;margin:20px}.pair{display:flex;gap:1%}.pair img{width:49%;object-fit:contain}section{border-bottom:1px solid #aaa;padding:16px}header{position:sticky;top:0;background:white;padding:12px}</style>'
-        '<header><b>残余连通区域归属确认</b> 不显示GT，不自动选择，不新增或删除前景。<button onclick="download()">导出 merge_decisions.json</button></header>'
+        '<header><b>残余归属与背景清理确认</b> 不显示GT，不自动选择；背景选项会删除对应前景。<button onclick="download()">导出 merge_decisions.json</button><label>恢复本页面已导出的选择<input type="file" accept=".json" onchange="restore(this)"></label></header>'
         '<p>只审查固定评分区域内的残余，ROI裁切可能分断实例。选择必须根据原影像田埂判断；颜色表示当前ID，不是正确性。所有项目默认保留，可只确认部分区域。</p>'
         +''.join(cards)+'<script>'+script+'</script>',encoding='utf-8')
     print(f'Open {output}/index.html; {len(rows)} components; no GT read; defaults keep all')
@@ -77,26 +81,30 @@ def apply(project,decisions,output):
     if not choices:raise ValueError('No residual assignments accepted')
     for row in choices:
         index=row.get('component');target=row.get('target_id')
-        if type(index) is not int or type(target) is not int or index in seen or index not in available or target not in available[index]['allowed_targets']:
+        if type(index) is not int or type(target) is not int or index in seen or index not in available:
             raise ValueError('Invalid, duplicate, or nonadjacent residual assignment')
+        if target==0:
+            if row.get('action')!='background' or not plan.get('allow_background_cleanup',False):raise ValueError('Invalid background action: explicit background confirmation required')
+        elif target not in available[index]['allowed_targets'] or row.get('action','merge')!='merge':raise ValueError('Invalid merge destination/action')
         seen.add(index)
     experiment,m=load(plan['experiment']);prior=sealed(Path(plan['source_result'])/'region_result.json')
     with rasterio.open(plan['source']) as src,rasterio.open(plan['mask']) as roi,rasterio.open(project/'components.tif') as labels:
-        before=src.read(1);data=before.copy();mask=roi.read(1)>0;components=labels.read(1)
+        before=src.read(1);data=before.copy();mask=roi.read(1)>0;components=labels.read(1);deleted=np.zeros_like(mask)
         for row in choices:
             selected=components==row['component']
             if np.any(selected&(~mask|(before!=plan['target_id']))):raise ValueError('Component outside residual write scope')
             data[selected]=row['target_id']
-        if np.any((data>0)!=(before>0)) or np.any(data[~mask]!=before[~mask]):raise ValueError('Unexpected foreground or context change')
+            if row['target_id']==0:deleted|=selected
+        if np.any((data>0)!=((before>0)&~deleted)) or np.any(data[~mask]!=before[~mask]):raise ValueError('Unexpected foreground or context change')
         output.mkdir(parents=True);save_labels(output/'region_result.tif',data,src.profile);save_mask(output/'changed_pixels.tif',data!=before,src.profile)
     sealed(project/'plan.json')
     report=dict(status='complete',experiment_sha256=digest(experiment/'experiment.json'),interaction_project=str(project),
-        start_method=prior['start_method'],reason=workflow['reason'],operation='residual-merge',write_policy='preserve-foreground-residual-merge',
+        start_method=prior['start_method'],reason=workflow['reason'],operation='residual-cleanup' if deleted.any() else 'residual-merge',write_policy='reviewed-background-cleanup' if deleted.any() else 'preserve-foreground-residual-merge',
         previous_result=plan['source_result'],interaction_round=prior.get('interaction_round',1),
         changed_pixels=int((data!=before).sum()),scoring_pixels=int(mask.sum()),assignments=choices,
-        added_foreground_pixels=0,removed_foreground_pixels=0,ground_truth_used_for_edits=False,
+        added_foreground_pixels=0,removed_foreground_pixels=int(deleted.sum()),merged_pixels=int(((data!=before)&~deleted).sum()),ground_truth_used_for_edits=False,
         input_sha256={str(p):digest(p) for p in [project/'workflow.json',project/'plan.json',Path(decisions).resolve(),output/'region_result.tif']})
-    write_json(output/'region_result.json',report);print(f'Exported {output}/region_result.tif; reassigned {report["changed_pixels"]} pixels; no foreground changes')
+    write_json(output/'region_result.json',report);print(f'Exported {output}/region_result.tif; merged={report["merged_pixels"]}; removed foreground={report["removed_foreground_pixels"]}; policy={report["write_policy"]}')
     return report
 
 

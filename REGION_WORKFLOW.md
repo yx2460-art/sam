@@ -220,3 +220,24 @@ python -m experiments.region_workflow score --experiment-dir outputs/region_case
 apply只修改确认分量的实例ID，不读取GT；其他ID和未确认残余不改，前景范围、地理网格和固定ROI保持不变，原第六轮文件不覆盖。评分表previous_interactive是第六轮原结果，interactive为归并后；同时保留原始融合对照。写策略记录为preserve-foreground-residual-merge，操作记录为residual-merge，并非新增SAM轮次。决策为空、重复区域、目标不相邻、原文件改变、输出目录存在都会拒绝执行。
 
 IoU应仍为0.873536，实例F1、PQ、边界F1须实测。部分归并可能使剩余ID 2继续作为未匹配实例存在，不能仅为了减少FP而强行归并全部区域。后续继续归并应使用已确认的归并结果重新prepare，以保留先前修改和新的邻接关系。人工审核已受先前开发诊断影响，不能称为独立盲测。
+
+### 新页面：同时允许明确的田埂／背景清理
+
+新版prepare页面包含三种选择：保留原ID（默认）、并入相邻已有ID、确认为背景／田埂（设为ID 0）。背景选项只适用于本编号整块红色区域均应为背景的情况；同一连通区域部分为田块、部分为田埂时暂时保留，不支持在此页面只删除一部分。依据原影像及既定标注规范判断，不能依据GT得分决定删除。
+
+```bash
+python -m experiments.merge_residuals prepare --result-dir outputs/region_case2_round6_result --target-id 2 --output-dir outputs/region_case2_round6_cleanup_review
+```
+
+使用新目录，不覆盖旧页面。旧决策文件绑定旧plan哈希，不能直接导入新页面；目前选择较少时在新页面重新选择。新版页面可恢复本页面导出的JSON，避免中途丢失进度：离开前先导出merge_decisions.json，返回后用“恢复本页面已导出的选择”导入。
+
+导出merge_decisions.json放入新项目目录，然后执行：
+
+```bash
+python -m experiments.merge_residuals apply --project-dir outputs/region_case2_round6_cleanup_review --decisions outputs/region_case2_round6_cleanup_review/merge_decisions.json --output-dir outputs/region_case2_round6_cleanup_result1
+python -m experiments.region_workflow score --experiment-dir outputs/region_case2 --gt "$HOME/xy/data/qgis_label_result3/instance.tif" --result-dir outputs/region_case2_round6_cleanup_result1 --output-dir outputs/region_case2_round6_cleanup_eval1
+```
+
+设为背景的导出记录必须同时包含target_id:0与action:background；仅把旧文件数字改为0不会被接受。旧版plan未声明支持背景清理也会拒绝背景操作。apply不读取GT，只处理人工确认的残余，不删除其他实例。报告分别记录merged_pixels和removed_foreground_pixels；包含实际删除时写策略为reviewed-background-cleanup，否则仍是preserve-foreground-residual-merge。不同策略分别保存、分别报告。
+
+本方案改变前景范围，IoU不再保证0.873536，可能提高也可能下降；必须与第六轮及仅归并对照并列评价，不覆盖旧成果。
