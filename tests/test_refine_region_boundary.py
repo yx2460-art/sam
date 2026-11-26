@@ -6,6 +6,21 @@ from experiments.refine_region_boundary import refine
 
 
 class BoundaryRefineTests(unittest.TestCase):
+    def test_add_only_real_grabcut_accepts_single_positive_and_never_deletes(self):
+        rgb=np.full((32,32,3),20,dtype=np.uint8);rgb[8:24,10:21]=220
+        source=np.zeros((32,32),dtype=np.uint32);source[8:24,10:21]=7;source[12:19,14:17]=0;source[14:16,17:22]=0;source[:,26:]=12
+        roi=np.ones_like(source,dtype=bool)
+        after,editable=refine(rgb,source,roi,7,[11,10,23,21],[[15,15]],[1],width=4,edit_mode='add-only')
+        self.assertEqual(after[15,15],7)
+        np.testing.assert_equal(after[source>0],source[source>0])
+        np.testing.assert_equal(after[~editable],source[~editable])
+        self.assertEqual(after[6,6],0)
+        def isolated(rgb,gc):gc[:]=0;gc[15,15]=1
+        with self.assertRaisesRegex(ValueError,'violates an explicit prompt'):
+            refine(rgb,source,roi,7,[11,10,23,21],[[15,15]],[1],width=4,edit_mode='add-only',cutter=isolated)
+        with self.assertRaisesRegex(ValueError,'negative point on existing foreground'):
+            refine(rgb,source,roi,7,[11,10,23,21],[[15,15],[13,15]],[1,0],width=4,edit_mode='add-only')
+
     def test_real_grabcut_respects_seeds_protected_ids_and_local_scope(self):
         rgb=np.full((32,32,3),20,dtype=np.uint8);rgb[8:24,10:21]=220
         source=np.zeros((32,32),dtype=np.uint32);source[8:24,9:21]=7;source[:,26:]=12

@@ -84,6 +84,22 @@ class RegionWorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'Invalid or empty'):
                 hole_apply(root/'hole_review',root/'empty_holes.json',root/'no_fill')
             self.assertFalse((root/'no_fill').exists())
+            from experiments.refine_region_boundary import prepare as gap_prepare,infer as gap_infer,apply as gap_apply
+            with patch('rasterio.open',side_effect=no_gt):
+                gap_prepare(root/'control',target,root/'add_project',width=8,edit_mode='add-only')
+            points=dict(plan_sha256=digest(root/'add_project'/'plan.json'),bounds=[4,4,12,12],points=[[7,7]],labels=[1])
+            (root/'add_points.json').write_text(json.dumps(points))
+            def fill_probable_background(rgb,gc):gc[gc==2]=1
+            with patch('rasterio.open',side_effect=no_gt):
+                proposal=gap_infer(root/'add_project',root/'add_points.json',root/'add_proposal',cutter=fill_probable_background)
+            self.assertEqual(proposal['removed_foreground_pixels'],0)
+            self.assertEqual(proposal['added_foreground_pixels'],16)
+            (root/'add_approval.json').write_text(json.dumps(dict(proposal_sha256=digest(root/'add_proposal'/'proposal.json'),accepted=True)))
+            with patch('rasterio.open',side_effect=no_gt):
+                added=gap_apply(root/'add_proposal',root/'add_approval.json',root/'added')
+            self.assertEqual(added['write_policy'],'reviewed-local-add-only')
+            gap_scores=fusion_scores(root/'region',args.gt,root/'add_eval',root/'added')
+            self.assertEqual(gap_scores['evaluation']['previous_interactive'],final['evaluation']['interactive'])
 
     def test_oriented_box_inference_exports_original_grid_and_same_roi(self):
         class BoxPredictor:

@@ -328,3 +328,28 @@ python -m experiments.region_workflow score --experiment-dir outputs/region_case
 ```
 
 只将人工确认的ID 0像素改为353，不创建新实例，不删除前景；主结果region_result.tif保持地理网格及原844800像素评分域。决策绑定本计划，原源文件不变、输出拒绝覆盖，空确认拒绝应用。scores中的previous_interactive是局部图割后起点，interactive是孔洞填补后。报告策略为reviewed-background-hole-completion，记录填补的像素数和孔洞编号。IoU及边界指标是否提高须实测，不能只凭轮廓消失判断。后续其他田块需从已确认的最新结果重新prepare并明确指定目标ID，不混用决策文件。
+
+## 外连缺口：单正点的“仅补充前景”图割模式
+
+当缺口连接外部背景、封闭孔洞候选为0，但原影像显示局部应属于田块时，不应随意放负点。本模式复用局部图割工具，显式启用add-only：已有前景固定为前景，其他实例保护；局部矩形、边界带和原ROI之外不修改。候选只允许将部分ID 0改为目标ID，不删除已有前景，不直接把整个矩形填满。无需人工负点，周围固定的非目标像素作为背景约束（不代表其都是真实背景）。
+
+```bash
+python -m experiments.refine_region_boundary prepare --result-dir outputs/region_case2_holes353_result1 --target-id 353 --band-width 16 --edit-mode add-only --output-dir outputs/region_case2_gap353_addonly
+```
+
+打开新目录index.html，重新框住要补的那一段缺口，选择正点，在确认属于353且位于青色带内的缺口中标一个或多个正点。新页面不提供负点选项，导出只需至少一个正点。旧项目JSON绑定旧plan哈希，不能直接混用。导出boundary_points.json放入新项目目录，运行：
+
+```bash
+python -m experiments.refine_region_boundary infer --project-dir outputs/region_case2_gap353_addonly --points outputs/region_case2_gap353_addonly/boundary_points.json --output-dir outputs/region_case2_gap353_addonly_proposals1
+```
+
+只保留与原目标前景8连通的新增部分，避免生成与田块断开的独立点块。若提示点未能包含在这种候选内，推理会拒绝，不强制制造几何填补。固定背景样本不足时也会拒绝，应缩小局部范围，不自动删除前景以制造负样本。真实田埂上的正点仍可能产生错误补充，需要原图复核，不保证精度提高。
+
+检查review.html，删除前景数应为0。候选符合原图才勾选接受，导出boundary_approval.json放入本次候选目录：
+
+```bash
+python -m experiments.refine_region_boundary apply --proposals-dir outputs/region_case2_gap353_addonly_proposals1 --approval outputs/region_case2_gap353_addonly_proposals1/boundary_approval.json --output-dir outputs/region_case2_gap353_addonly_result1
+python -m experiments.region_workflow score --experiment-dir outputs/region_case2 --gt "$HOME/xy/data/qgis_label_result3/instance.tif" --result-dir outputs/region_case2_gap353_addonly_result1 --output-dir outputs/region_case2_gap353_addonly_eval1
+```
+
+报告write_policy为reviewed-local-add-only；原refine模式继续要求正负点，行为不变。保留源结果和失败尝试。本次评分仍在原844800像素ROI内，与孔洞填补后的起点比较，新增前景可能使IoU、边界及实例指标提高或下降，需实测。
