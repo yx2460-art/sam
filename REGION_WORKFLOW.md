@@ -307,3 +307,24 @@ python -m experiments.region_workflow score --experiment-dir outputs/region_case
 ```
 
 比较previous_interactive与interactive的四项指标，重点看边界F1改善是否保留实例F1/PQ。允许前景增删，IoU不保证不变；保留原起点和所有失败尝试。记录两次框点、正负点数量、浏览器停留时间（不等同于净操作时间）及推理耗时。重试使用新点文件和新输出目录。当前区域已用于多轮开发诊断，不称为独立测试，选定方案后需另一区域验证。
+
+## 田块内部背景孔洞：人工逐项确认填补
+
+ID查看结果显示异常内部为0、周围田块为353时，先做封闭孔洞对照，不直接统一填洞：
+
+```bash
+python -m experiments.fill_region_holes prepare --result-dir outputs/region_case2_boundary349_result1 --target-id 353 --output-dir outputs/region_case2_holes353_review
+```
+
+打开index.html，每项左图为原影像，右图红色为当前背景孔洞，周围目标实例为半透明青色。默认全部不勾选。只有根据原影像确认整块孔洞均属于该田块、不是实际非耕作区／田埂时，才勾选填入353。有疑问保留，可只确认部分候选。候选不读取GT、不运行SAM。
+
+候选以原上下文网格的8连通背景分量提取：必须完全位于固定ROI内，不触及上下文裁块边缘，周边正ID必须只有353。与外部背景通过细缝或对角线连接的缺口、涉及其他实例的背景、被ROI截断的区域都会排除。不按面积阈值自动填补，不覆盖其他ID。若页面没有候选，不能判定没有漏分，应另检查外连缺口并使用局部修正。
+
+导出hole_decisions.json放入本项目目录，确认后执行：
+
+```bash
+python -m experiments.fill_region_holes apply --project-dir outputs/region_case2_holes353_review --decisions outputs/region_case2_holes353_review/hole_decisions.json --output-dir outputs/region_case2_holes353_result1
+python -m experiments.region_workflow score --experiment-dir outputs/region_case2 --gt "$HOME/xy/data/qgis_label_result3/instance.tif" --result-dir outputs/region_case2_holes353_result1 --output-dir outputs/region_case2_holes353_eval1
+```
+
+只将人工确认的ID 0像素改为353，不创建新实例，不删除前景；主结果region_result.tif保持地理网格及原844800像素评分域。决策绑定本计划，原源文件不变、输出拒绝覆盖，空确认拒绝应用。scores中的previous_interactive是局部图割后起点，interactive是孔洞填补后。报告策略为reviewed-background-hole-completion，记录填补的像素数和孔洞编号。IoU及边界指标是否提高须实测，不能只凭轮廓消失判断。后续其他田块需从已确认的最新结果重新prepare并明确指定目标ID，不混用决策文件。

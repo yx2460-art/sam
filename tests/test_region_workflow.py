@@ -60,6 +60,30 @@ class RegionWorkflowTests(unittest.TestCase):
             diagnosis=diagnose(root/'region',root/'control',args.gt,root/'diagnose_control')
             self.assertEqual(diagnosis['last_round_changes']['wrong_added_foreground'],0)
             self.assertEqual(diagnosis['last_round_changes']['correct_added_foreground'],0)
+            from experiments.fill_region_holes import prepare as hole_prepare,apply as hole_apply
+            target=int(after[5,5])
+            with patch('rasterio.open',side_effect=no_gt):
+                hole_plan=hole_prepare(root/'control',target,root/'hole_review')
+            self.assertEqual(len(hole_plan['holes']),1)
+            decisions=dict(plan_sha256=digest(root/'hole_review'/'plan.json'),accepted_ids=[hole_plan['holes'][0]['id']])
+            (root/'hole_decisions.json').write_text(json.dumps(decisions))
+            before_hole_hash=digest(root/'control'/'region_result.tif')
+            with patch('rasterio.open',side_effect=no_gt):
+                filled=hole_apply(root/'hole_review',root/'hole_decisions.json',root/'holes_filled')
+            self.assertEqual(filled['added_foreground_pixels'],16)
+            self.assertEqual(before_hole_hash,digest(root/'control'/'region_result.tif'))
+            with actual(root/'holes_filled'/'region_result.tif') as src:filled_data=src.read(1)
+            change=filled_data!=after
+            self.assertTrue(np.all(after[change]==0));self.assertTrue(np.all(filled_data[change]==target))
+            np.testing.assert_equal(filled_data[~mask],after[~mask])
+            np.testing.assert_equal(filled_data[after==2],after[after==2])
+            hole_scores=fusion_scores(root/'region',args.gt,root/'holes_eval',root/'holes_filled')
+            self.assertEqual(hole_scores['evaluation']['previous_interactive'],final['evaluation']['interactive'])
+            self.assertGreater(hole_scores['evaluation']['interactive']['mask_iou'],final['evaluation']['interactive']['mask_iou'])
+            decisions['accepted_ids']=[];(root/'empty_holes.json').write_text(json.dumps(decisions))
+            with self.assertRaisesRegex(ValueError,'Invalid or empty'):
+                hole_apply(root/'hole_review',root/'empty_holes.json',root/'no_fill')
+            self.assertFalse((root/'no_fill').exists())
 
     def test_oriented_box_inference_exports_original_grid_and_same_roi(self):
         class BoxPredictor:
