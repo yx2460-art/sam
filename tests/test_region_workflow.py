@@ -103,6 +103,26 @@ class RegionWorkflowTests(unittest.TestCase):
             self.assertEqual(sum(row['pixels'] for row in diagnosis['residual']['components']),diagnosis['residual']['roi_pixels'])
             self.assertTrue((root/'diagnose'/'index.html').exists())
             self.assertTrue(diagnosis['new_pred_ids'])
+            from experiments.refine_region_boundary import prepare as boundary_prepare,infer as boundary_infer,apply as boundary_apply
+            from experiments.metrics import label_boundary
+            from scipy import ndimage
+            boundary_prepare(root/'result',anchor,root/'boundary_project',width=3)
+            eligible=ndimage.maximum_filter(label_boundary((after==anchor).astype(np.uint8)),size=7)&mask&(after==anchor)
+            yy,xx=np.where(eligible);prompts=[[int(xx[0]),int(yy[0])],[int(xx[-1]),int(yy[-1])]]
+            boundary_points=dict(plan_sha256=digest(root/'boundary_project'/'plan.json'),bounds=[0,0,after.shape[1],after.shape[0]],points=prompts,labels=[1,0])
+            (root/'boundary_points.json').write_text(json.dumps(boundary_points))
+            def deterministic_cut(rgb,gc):gc[:]=np.where(np.isin(gc,[1,3]),1,0)
+            boundary_infer(root/'boundary_project',root/'boundary_points.json',root/'boundary_proposals',cutter=deterministic_cut)
+            approval=dict(proposal_sha256=digest(root/'boundary_proposals'/'proposal.json'),accepted=False)
+            (root/'boundary_approval.json').write_text(json.dumps(approval))
+            with self.assertRaisesRegex(ValueError,'not explicitly accepted'):
+                boundary_apply(root/'boundary_proposals',root/'boundary_approval.json',root/'unaccepted_boundary')
+            approval['accepted']=True;(root/'boundary_approval.json').write_text(json.dumps(approval))
+            boundary_apply(root/'boundary_proposals',root/'boundary_approval.json',root/'boundary_result')
+            self.assertEqual(before_hash,digest(root/'result'/'region_result.tif'))
+            boundary_score=fusion_scores(root/'region',args.gt,root/'boundary_eval',root/'boundary_result')
+            self.assertEqual(boundary_score['evaluation']['previous_interactive'],final['evaluation']['interactive'])
+            self.assertEqual(boundary_score['write_policy'],'reviewed-local-boundary')
             from experiments.inspect_region_ids import prepare as inspect_ids
             actual_open=rasterio.open
             def no_gt_inspection(path,*a,**kw):

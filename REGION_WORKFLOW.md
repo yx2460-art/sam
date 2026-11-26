@@ -284,3 +284,26 @@ python -m experiments.region_workflow start --experiment-dir outputs/region_uppe
 ```
 
 后续按斜框＋正负点、确认候选、apply和score流程，使用全新目录。固定范围外依然不标点、不回写。新区域的面积、实例集合与旧区域不同，不能将分数直接串入旧844800像素的逐轮对比表；本区域后续与迁移后的起点在同一ROI比较。准备新区域可能使用已缓存全图提示，但不重新推理SAM；缓存不足时不要强行复用。
+
+## 原区域2：局部边界图割对照
+
+保持原844800像素评分域，以outputs/region_case2_id13_round1_result为起点。先在原影像中找一个边界偏差明确的位置，尝试目标349；不为跨过GT匹配阈值而修边。本工具使用OpenCV GrabCut，不运行SAM，不读取GT。需要环境已安装opencv-python。
+
+```bash
+python -m experiments.refine_region_boundary prepare --result-dir outputs/region_case2_id13_round1_result --target-id 349 --band-width 8 --output-dir outputs/region_case2_boundary349
+```
+
+打开index.html。青色为目标边界两侧8像素的可编辑带，排除评分域外及其他已有实例。先用两个对角点画一个局部水平矩形，只框明确的误差位置，再切换正点／负点，在矩形内的青色带中标记田块／田埂。至少一正一负、最多32点；不支持改其他实例或远离边界的位置，不按GT描边。可切换原图观察。矩形只限制局部修改范围，不是之前的SAM斜框。导出boundary_points.json放入项目目录。
+
+```bash
+python -m experiments.refine_region_boundary infer --project-dir outputs/region_case2_boundary349 --points outputs/region_case2_boundary349/boundary_points.json --output-dir outputs/region_case2_boundary349_proposals1
+```
+
+GrabCut用当前前景初始化概率标签、正负点为硬标签，候选回写范围限定为矩形、边界带、ROI与目标／背景的交集；其余实例和目标内部受保护。该方法依赖局部外观，不保证比SAM或原边界好。检查review.html的前后图、前景增删像素、目标8连通区域数量，注意断裂与孔洞。默认不接受。合理才勾选导出boundary_approval.json放入候选目录。
+
+```bash
+python -m experiments.refine_region_boundary apply --proposals-dir outputs/region_case2_boundary349_proposals1 --approval outputs/region_case2_boundary349_proposals1/boundary_approval.json --output-dir outputs/region_case2_boundary349_result1
+python -m experiments.region_workflow score --experiment-dir outputs/region_case2 --gt "$HOME/xy/data/qgis_label_result3/instance.tif" --result-dir outputs/region_case2_boundary349_result1 --output-dir outputs/region_case2_boundary349_eval1
+```
+
+比较previous_interactive与interactive的四项指标，重点看边界F1改善是否保留实例F1/PQ。允许前景增删，IoU不保证不变；保留原起点和所有失败尝试。记录两次框点、正负点数量、浏览器停留时间（不等同于净操作时间）及推理耗时。重试使用新点文件和新输出目录。当前区域已用于多轮开发诊断，不称为独立测试，选定方案后需另一区域验证。
