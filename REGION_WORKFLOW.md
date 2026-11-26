@@ -255,3 +255,32 @@ python -m experiments.inspect_region_ids --result-dir outputs/region_case2_round
 确认实际目标ID后，沿用region_workflow start，from-result必须是outputs/region_case2_round6_cleanup_result1，target-id替换为点击得到的真实ID，使用新的region_case2_upper_round1目录。第一份fusion-scores和fusion方法仍保持原先设置，使用single-target斜框＋正负点模式；保护其他已完成ID，不回到早期union。先检查候选再接受。若继续选择preserve-foreground，其IoU应保持最新清理结果的0.875449，而非清理前0.873536。清理与后续SAM交互是不同操作阶段，均保留记录。
 
 ID查看页不读取GT、不运行SAM、不修改结果。确认目标位置和ID之后再启动下一轮，避免针对错误父实例。
+
+## 目标被旧区域上边界截断：新区域计划与已确认结果迁移
+
+旧region_case2上界y=6895不能直接上移并沿用旧分数。先扫描原始全图实例13范围、缓存裁块和有效标注ROI，不读取GT：
+
+```bash
+python -m experiments.reframe_region plan --result-dir outputs/region_case2_round6_cleanup_result1 --instance-id 13 --output-dir outputs/region_upper_plan
+```
+
+查看summary.txt及plan.json。ready表示源实例完整包围框位于缓存裁块内且其所有源前景像素有有效ROI覆盖；这不证明真实田块边界完整，仍需查看新区域影像。cache_missing表示需要先生成覆盖上方的新滑窗缓存；annotation_partial表示源目标有部分像素不在有效标注ROI，需核实／补齐标注后才做完整目标评价，不能把未标注部分当背景。非ready计划会拒绝prepare，先报告缺口，不跳过像素。
+
+ready时执行（均为新目录，不修改旧实验）：
+
+```bash
+python -m experiments.reframe_region prepare --plan-dir outputs/region_upper_plan --output-dir outputs/region_upper_experiment
+python -m experiments.region_workflow score --experiment-dir outputs/region_upper_experiment --gt "$HOME/xy/data/qgis_label_result3/instance.tif" --output-dir outputs/region_upper_fusion_eval
+python -m experiments.reframe_region initialize --plan-dir outputs/region_upper_plan --experiment-dir outputs/region_upper_experiment --fusion-scores outputs/region_upper_fusion_eval --output-dir outputs/region_upper_start
+python -m experiments.region_workflow score --experiment-dir outputs/region_upper_experiment --gt "$HOME/xy/data/qgis_label_result3/instance.tif" --result-dir outputs/region_upper_start --output-dir outputs/region_upper_start_eval
+```
+
+新区域从源实例13完整包围矩形定位，评分域仍是矩形与既有有效ROI的交集，不声称未裁切全田块评价。initialize在新区域求并图上迁移旧已确认结果：仅旧固定回写mask与新上下文的重叠部分，包含此前归并、背景清理和新实例ID；重叠外用同一融合方式的缓存结果。按全图像素坐标和地理变换校验迁移，不直接拼接PNG。旧目录不动。start_eval中的interactive是迁移后、下一次SAM之前的新区域起点，不代表一次新的SAM改善。
+
+确认新区域完整显示目标后再启动：
+
+```bash
+python -m experiments.region_workflow start --experiment-dir outputs/region_upper_experiment --fusion-scores outputs/region_upper_fusion_eval --fusion union --from-result outputs/region_upper_start --target-id 13 --interaction-mode single-target --reason "New fixed region for previously clipped source ID 13" --output-dir outputs/region_upper_interaction1
+```
+
+后续按斜框＋正负点、确认候选、apply和score流程，使用全新目录。固定范围外依然不标点、不回写。新区域的面积、实例集合与旧区域不同，不能将分数直接串入旧844800像素的逐轮对比表；本区域后续与迁移后的起点在同一ROI比较。准备新区域可能使用已缓存全图提示，但不重新推理SAM；缓存不足时不要强行复用。

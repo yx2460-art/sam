@@ -113,6 +113,28 @@ class RegionWorkflowTests(unittest.TestCase):
             self.assertEqual(sum(inspected['roi_id_pixels'].values()),first['scoring_pixels'])
             self.assertEqual(before_hash,digest(root/'result'/'region_result.tif'))
             self.assertTrue((root/'id_view'/'index.html').exists())
+            from experiments.reframe_region import plan as reframe_plan,prepare as reframe_prepare,initialize
+            with patch('rasterio.open',side_effect=no_gt_inspection):
+                planned=reframe_plan(root/'result',1,root/'reframe_plan')
+                self.assertEqual(planned['status'],'ready')
+                reframe_prepare(root/'reframe_plan',root/'expanded')
+            expanded_first=fusion_scores(root/'expanded',args.gt,root/'expanded_scores')
+            with patch('rasterio.open',side_effect=no_gt_inspection):
+                initialize(root/'reframe_plan',root/'expanded',root/'expanded_scores',root/'transferred')
+            self.assertEqual(before_hash,digest(root/'result'/'region_result.tif'))
+            with rasterio.open(root/'transferred'/'region_result.tif') as src:expanded=src.read(1)
+            np.testing.assert_equal(expanded[4:20,4:20],after[2:18,2:18])
+            transferred_scores=fusion_scores(root/'expanded',args.gt,root/'transfer_scores',root/'transferred')
+            self.assertEqual(transferred_scores['scoring_pixels'],expanded_first['scoring_pixels'])
+            self.assertGreater(transferred_scores['scoring_pixels'],first['scoring_pixels'])
+            start(root/'expanded',root/'expanded_scores','union','new region interaction',root/'new_interaction',target_id=anchor,interaction_mode='single-target',from_result=root/'transferred')
+            from experiments.manual_fusion import read as real_read
+            manifest=real_read(root/'tiles'/'manifest.json');manifest['crop_xyxy']=[4,4,20,20]
+            with patch('experiments.reframe_region.read',return_value=manifest):
+                blocked=reframe_plan(root/'result',1,root/'blocked_reframe')
+            self.assertEqual(blocked['status'],'cache_missing')
+            with self.assertRaisesRegex(ValueError,'not ready'):
+                reframe_prepare(root/'blocked_reframe',root/'should_not_prepare')
             from experiments.merge_residuals import prepare as merge_prepare,apply as merge_apply
             actual=rasterio.open
             def no_gt(path,*a,**kw):
